@@ -1,0 +1,977 @@
+"""Offline test suite. No network and no API keys: run `pytest -q` (or `pytest -s` to see the tear sheet).
+
+The synthetic generator builds 2,000 session-aligned hourly bars in four regimes:
+  BULL  (800 bars) strong uptrend with periodic pullbacks
+  CHOP  (400 bars) sideways zig-zag, balanced directional movement (low ADX)
+  CRASH (300 bars) high-volatility selloff
+  DEAD  (500 bars) near-zero volatility
+The regimes are deliberately unambiguous: they test the filter logic, not market edge.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import math
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import evaluate_trust
+from backtest import Backtester, format_tear_sheet
+from bot import TradingBot
+from config import BacktestConfig, ExecutionConfig, RiskConfig, StrategyConfig
+from src import journal as J
+from src.indicators import add_indicators
+from src.journal import COLUMNS, TradeJournal, read_journal, slippage_bps
+from src.risk_manager import RiskManager, client_order_id, r_multiple
+from src.sessions import ET, complete_bars, in_trading_window, latest_bar_end, to_session_bars
+from src.strategy import (EXIT, LONG, R_CHOP, R_DEAD, R_ENTRY, R_SPIKE, WAIT, decide_latest, describe,
+                          evaluate_closed_bars, generate_signals, resolve_state)
+
+CFG = StrategyConfig()
+OHLC = ["open", "high", "low", "close"]
+REGIMES = [("BULL", 800), ("CHOP", 400), ("CRASH", 300), ("DEAD", 500)]
+SEEDS = [7, 1, 2, 3]
+
+
+# ============================================================================ synthetic data
+def session_index(n: int, start: str = "2023-01-03") -> pd.DatetimeIndex:
+    days = pd.bdate_range(start, periods=n // 7 + 2, tz=ET.zone)
+    stamps = [d + pd.Timedelta(hours=9, minutes=30) + pd.Timedelta(hours=h) for d in days for h in range(7)]
+    return pd.DatetimeIndex(stamps[:n], name="timestamp")
+
+
+def make_synthetic_ohlcv(seed: int = 7, start: str = "2023-01-03", bull_noise: float = 0.0025,
+                         bull_drift: float = 0.0030) -> pd.DataFrame:
+    """2,000 hourly bars across the four regimes, with a `regime` label column.
+    Raise `bull_noise` to make pullbacks fail more often (stop-losses actually get hit)."""
+    rng = np.random.default_rng(seed)
+    log_price, anchor = np.log(100.0), None
+    path, sigmas, labels = [], [], []
+    for name, length in REGIMES:
+        for i in range(length):
+            if name == "BULL":      # 20 bars up, 8 bars pullback
+                sigma = bull_noise
+                step = (bull_drift if i % 28 < 20 else -0.0050) + rng.normal(0, sigma)
+            elif name == "CHOP":    # alternating bars pinned around the regime's starting level
+                anchor = log_price if i == 0 else anchor
+                sigma = 0.0035
+                step = (0.004 if i % 2 == 0 else -0.004) - 0.5 * (log_price - anchor) + rng.normal(0, 0.001)
+            elif name == "CRASH":   # ~8x the volatility, negative drift
+                sigma = 0.02
+                step = -0.004 + rng.normal(0, sigma)
+            else:                   # DEAD: tiny noise around a flat level
+                anchor = log_price if i == 0 else anchor
+                sigma = 0.0004
+                step = -0.2 * (log_price - anchor) + rng.normal(0, sigma)
+            log_price += step
+            path.append(log_price)
+            sigmas.append(sigma)
+            labels.append(name)
+    close = np.exp(np.array(path))
+    sigmas = np.array(sigmas)
+    prev_close = np.concatenate([[100.0], close[:-1]])
+    open_ = prev_close * np.exp(rng.normal(0, sigmas * 0.2))
+    wicks = np.abs(rng.normal(0, sigmas * 0.5, (2, len(close))))
+    return pd.DataFrame({
+        "open": open_,
+        "high": np.maximum(open_, close) * np.exp(wicks[0]),
+        "low": np.minimum(open_, close) * np.exp(-wicks[1]),
+        "close": close,
+        "volume": rng.integers(100_000, 1_000_000, len(close)).astype(float),
+        "regime": labels,
+    }, index=session_index(len(close), start))
+
+
+def with_session_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add the bar_end / n_source / n_expected columns the live client attaches."""
+    out = df[OHLC + ["volume"]].copy()
+    start_min = out.index.hour * 60 + out.index.minute
+    end_min = np.minimum(np.asarray(start_min) + 60, 16 * 60)
+    out["bar_end"] = out.index.normalize() + pd.to_timedelta(end_min, unit="min")
+    out["n_expected"] = (end_min - np.asarray(start_min)) // 30
+    out["n_source"] = out["n_expected"]
+    return out
+
+
+@pytest.fixture(scope="module")
+def synthetic() -> pd.DataFrame:
+    return make_synthetic_ohlcv(7)
+
+
+@pytest.fixture(scope="module")
+def signals(synthetic) -> pd.DataFrame:
+    return generate_signals(synthetic[OHLC], CFG)
+
+
+def test_synthetic_generator_shape(synthetic):
+    assert len(synthetic) == 2000
+    assert synthetic["regime"].value_counts().to_dict() == dict(REGIMES)
+    assert (synthetic["high"] >= synthetic[["open", "close"]].max(axis=1)).all()
+    assert (synthetic["low"] <= synthetic[["open", "close"]].min(axis=1)).all()
+    assert synthetic.index.is_monotonic_increasing and synthetic.index.tz is not None
+    natr = add_indicators(synthetic[OHLC], CFG).groupby(synthetic["regime"])["natr"].median()
+    assert natr["CRASH"] > 4 * natr["BULL"] and natr["DEAD"] < natr["BULL"] / 4
+
+
+# ============================================================================ indicators
+def _ref_wilder(values: list[float], period: int) -> list[float]:
+    out = [math.nan] * len(values)
+    first = next(i for i, v in enumerate(values) if not math.isnan(v))
+    seed = first + period - 1
+    out[seed] = sum(values[first:seed + 1]) / period
+    for i in range(seed + 1, len(values)):
+        out[i] = (out[i - 1] * (period - 1) + values[i]) / period
+    return out
+
+
+def _ref_indicators(df: pd.DataFrame, n: int = 14) -> dict[str, list[float]]:
+    h, l, c = df["high"].tolist(), df["low"].tolist(), df["close"].tolist()
+    gains, losses, tr, pdm, mdm = [math.nan], [math.nan], [h[0] - l[0]], [math.nan], [math.nan]
+    for i in range(1, len(c)):
+        change = c[i] - c[i - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+        tr.append(max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])))
+        up, down = h[i] - h[i - 1], l[i - 1] - l[i]
+        pdm.append(up if up > down and up > 0 else 0.0)
+        mdm.append(down if down > up and down > 0 else 0.0)
+    ag, al = _ref_wilder(gains, n), _ref_wilder(losses, n)
+    rsi = [math.nan if math.isnan(g) else (100.0 if lo == 0 else 100 - 100 / (1 + g / lo)) for g, lo in zip(ag, al)]
+    atr = _ref_wilder(tr, n)
+    tr_dm = [math.nan] + tr[1:]
+    s_tr, s_p, s_m = _ref_wilder(tr_dm, n), _ref_wilder(pdm, n), _ref_wilder(mdm, n)
+    dx = []
+    for t, p, m in zip(s_tr, s_p, s_m):
+        if math.isnan(t):
+            dx.append(math.nan)
+            continue
+        pdi, mdi = 100 * p / t, 100 * m / t
+        dx.append(0.0 if pdi + mdi == 0 else 100 * abs(pdi - mdi) / (pdi + mdi))
+    return {"rsi": rsi, "atr": atr, "adx": _ref_wilder(dx, n)}
+
+
+def test_indicators_match_textbook_wilder_loops(synthetic):
+    df = synthetic[OHLC].iloc[:600]
+    ind = add_indicators(df, CFG)
+    ref = _ref_indicators(df)
+    for name in ("rsi", "atr", "adx"):
+        np.testing.assert_allclose(ind[name].to_numpy(), np.array(ref[name]), rtol=1e-9, atol=1e-9,
+                                   equal_nan=True, err_msg=name)
+    ema = [math.nan] * len(df)
+    alpha, value = 2 / (CFG.ema_fast + 1), df["close"].iloc[0]
+    for i, price in enumerate(df["close"]):
+        value = price if i == 0 else alpha * price + (1 - alpha) * value
+        ema[i] = value if i >= CFG.ema_fast - 1 else math.nan
+    np.testing.assert_allclose(ind["ema_fast"].to_numpy(), ema, rtol=1e-12, equal_nan=True)
+
+
+def test_indicator_edge_cases():
+    idx = session_index(60)
+    rising = pd.DataFrame({"close": np.linspace(100, 160, 60)}, index=idx)
+    rising["open"] = rising["close"] - 0.5
+    rising["high"], rising["low"] = rising["close"] + 0.1, rising["open"] - 0.1
+    ind = add_indicators(rising[OHLC], CFG)
+    assert ind["rsi"].dropna().eq(100.0).all()                  # no losses -> RSI 100
+    assert ind["rsi"].iloc[:CFG.rsi_period].isna().all()        # Wilder needs `period` deltas
+    assert ind["adx"].dropna().iloc[-1] > 90                     # one-way trend -> ADX near 100
+    flat = rising.assign(open=100.0, high=100.0, low=100.0, close=100.0)
+    assert add_indicators(flat[OHLC], CFG)["rsi"].dropna().eq(50.0).all()
+
+
+# ============================================================================ look-ahead bias
+LOOKAHEAD_POINTS = [450, 527, 600, 801, 1000, 1201, 1650, 1999]
+
+
+def test_altering_bar_t_never_changes_decisions_up_to_t(synthetic, signals):
+    ohlc = synthetic[OHLC]
+    for t in LOOKAHEAD_POINTS:
+        mutated = ohlc.copy()
+        mutated.iloc[t:] = mutated.iloc[t:] * 1.37
+        mutated.iloc[t, mutated.columns.get_loc("high")] *= 3.0     # absurd bar t
+        mutated.iloc[t, mutated.columns.get_loc("low")] *= 0.2
+        result = generate_signals(mutated, CFG)
+        pd.testing.assert_frame_equal(result.iloc[:t + 1], signals.iloc[:t + 1], check_exact=True)
+        if t + 1 < len(ohlc):  # the test is not vacuous: bar t does feed decision t+1
+            assert result["close"].iloc[t + 1] != signals["close"].iloc[t + 1]
+
+
+def test_lookahead_check_catches_an_unshifted_signal(synthetic):
+    """Negative control: without shift(1), altering bar t changes the row for bar t."""
+    ohlc = synthetic[OHLC]
+    t = 600
+    mutated = ohlc.copy()
+    mutated.iloc[t:] = mutated.iloc[t:] * 1.37
+    unshifted_a = evaluate_closed_bars(ohlc, CFG)
+    unshifted_b = evaluate_closed_bars(mutated, CFG)
+    assert unshifted_a["close"].iloc[t] != unshifted_b["close"].iloc[t]
+
+
+def test_prefix_invariance(synthetic, signals):
+    for t in LOOKAHEAD_POINTS:
+        prefix = generate_signals(synthetic[OHLC].iloc[:t + 1], CFG)
+        pd.testing.assert_frame_equal(prefix, signals.iloc[:t + 1], check_exact=True)
+
+
+def test_live_decision_path_matches_backtest_signals(synthetic, signals):
+    ohlc = synthetic[OHLC]
+    long_rows = list(np.flatnonzero(signals["entry"].to_numpy()))
+    for t in LOOKAHEAD_POINTS[:-1] + long_rows:
+        live = decide_latest(ohlc.iloc[:t], CFG)
+        pd.testing.assert_series_equal(live, signals.iloc[t], check_names=False, check_exact=True)
+
+
+# ============================================================================ strategy rules
+def test_long_signals_satisfy_every_rule_and_nothing_else_does(synthetic, signals):
+    ind = add_indicators(synthetic[OHLC], CFG)
+    rsi, close, high = ind["rsi"].to_numpy(), ind["close"].to_numpy(), ind["high"].to_numpy()
+    expected = np.zeros(len(ind), dtype=bool)
+    for t in range(CFG.warmup_bars, len(ind)):
+        k = t - 1  # last closed bar
+        row = ind.iloc[k]
+        expected[t] = bool(
+            row.close > row.ema_slow and row.ema_fast > row.ema_slow
+            and row.adx >= CFG.adx_min and row.natr_lo <= row.natr <= row.natr_hi
+            and rsi[k] > CFG.rsi_trigger >= rsi[k - 1]
+            and min(rsi[k - 2:k + 1]) < CFG.rsi_trigger
+            and close[k] > high[k - 1]
+        )
+    assert expected.sum() >= 5
+    np.testing.assert_array_equal(signals["entry"].to_numpy(), expected)
+
+
+def test_no_signal_before_warmup(signals):
+    assert not signals["entry"].iloc[:CFG.warmup_bars].any()
+    assert (signals["reason_code"].iloc[:CFG.warmup_bars - 1] == "WARMUP").all()
+
+
+def _regime_signals(seed: int):
+    df = make_synthetic_ohlcv(seed)
+    sig = generate_signals(df[OHLC], CFG)
+    return df, sig
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_chop_regime_outputs_wait(seed):
+    df, sig = _regime_signals(seed)
+    chop = sig[df["regime"].to_numpy() == "CHOP"]
+    states = {resolve_state(row, in_position=False)[0] for _, row in chop.iterrows()}
+    assert states == {WAIT}
+    assert (chop["reason_code"] == R_CHOP).mean() > 0.5, chop["reason_code"].value_counts()
+    assert chop["adx"].iloc[2 * CFG.adx_period:].median() < CFG.adx_min
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_volatility_spike_regime_outputs_wait(seed):
+    df, sig = _regime_signals(seed)
+    crash = sig[df["regime"].to_numpy() == "CRASH"]
+    assert {resolve_state(row, in_position=False)[0] for _, row in crash.iterrows()} == {WAIT}
+    assert crash["spike"].iloc[:5].any(), "spike filter must fire as soon as the crash starts"
+    assert (crash["reason_code"] == R_SPIKE).sum() > 0
+    onset = crash[crash["spike"]].iloc[0]
+    assert R_SPIKE in describe(onset, CFG)
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_dead_regime_flags_volatility_dead(seed):
+    df, sig = _regime_signals(seed)
+    dead = sig[df["regime"].to_numpy() == "DEAD"]
+    assert not dead["entry"].any()
+    assert dead["dead"].iloc[:10].any()
+    assert R_DEAD in describe(dead[dead["dead"]].iloc[0], CFG)
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_bull_regime_produces_long_entries(seed):
+    df, sig = _regime_signals(seed)
+    bull = sig[df["regime"].to_numpy() == "BULL"]
+    assert bull["entry"].sum() >= 5
+
+
+def test_resolve_state_and_reason_text(signals):
+    entry_row = signals[signals["entry"]].iloc[0]
+    assert resolve_state(entry_row, in_position=False) == (LONG, R_ENTRY)
+    assert "crossed 42.00" in describe(entry_row, CFG)
+    exit_row = signals[signals["exit"] & ~signals["warm"]].iloc[0]
+    assert resolve_state(exit_row, in_position=True, exit_armed=True)[0] == EXIT
+    assert resolve_state(exit_row, in_position=True, exit_armed=False)[0] == WAIT
+    assert "not armed" in describe(exit_row, CFG, in_position=True, exit_armed=False)
+    wait_row = signals[signals["reason_code"] == R_CHOP].iloc[0]
+    assert describe(wait_row, CFG).startswith(f"{R_CHOP}: ADX[t-1]")
+
+
+# ============================================================================ risk manager
+def test_sizing_risks_exactly_one_percent():
+    rm = RiskManager(RiskConfig(), StrategyConfig())
+    size = rm.size_position(equity=100_000, entry_ref=50.0, atr=2.5)
+    assert size.shares == 200                       # 1,000 / (2.0 * 2.5)
+    assert size.stop_price == 45.0 and size.take_profit == 57.5
+    assert size.risk_dollars == pytest.approx(1_000.0)
+    assert size.risk_pct == pytest.approx(0.01)
+    assert size.notional_pct == pytest.approx(0.10)
+    assert size.binding_constraint == "RISK"
+
+
+def test_sizing_never_exceeds_one_percent():
+    rm = RiskManager(RiskConfig(), StrategyConfig())
+    rng = np.random.default_rng(0)
+    for _ in range(2_000):
+        equity, price = rng.uniform(5_000, 1_000_000), rng.uniform(5, 1_500)
+        atr = price * rng.uniform(0.002, 0.08)
+        size = rm.size_position(equity, price, atr)
+        assert size.risk_pct <= 0.01 + 1e-12
+        assert size.notional_pct <= 0.20 + 1e-12
+        if size.binding_constraint == "RISK":  # rounding down costs less than one share of risk
+            assert size.risk_dollars > equity * 0.01 - 2 * atr
+
+
+def test_notional_cap_binds_on_tight_hourly_stops():
+    rm = RiskManager(RiskConfig(), StrategyConfig())
+    size = rm.size_position(equity=100_000, entry_ref=500.0, atr=1.0)  # 1% risk would need 500 shares
+    assert size.shares == 40 and size.binding_constraint == "NOTIONAL_CAP"
+    assert size.notional_pct == pytest.approx(0.20)
+    assert size.risk_pct == pytest.approx(0.0008)
+
+
+def test_buying_power_and_zero_size():
+    rm = RiskManager(RiskConfig(), StrategyConfig())
+    assert rm.size_position(100_000, 50.0, 2.5, buying_power=4_000).shares == 80
+    assert rm.size_position(1_000, 50.0, 100.0).shares == 0
+    assert rm.size_position(100_000, 50.0, float("nan")).shares == 0
+
+
+def test_kill_switch_trips_at_three_percent_and_latches():
+    rm = RiskManager(RiskConfig(), StrategyConfig())
+    day = dt.date(2026, 10, 12)
+    assert not rm.check_daily_drawdown(day, 100_000, 98_000).tripped
+    assert not rm.check_daily_drawdown(day, 100_000, 97_000.01).tripped
+    status = rm.check_daily_drawdown(day, 100_000, 97_000)
+    assert status.tripped and status.newly_tripped and status.daily_pnl_pct == pytest.approx(-0.03)
+    again = rm.check_daily_drawdown(day, 100_000, 99_500)   # recovery does not re-arm trading
+    assert again.tripped and not again.newly_tripped
+    assert rm.entry_block_reason("SPY", day, [], [], [], "id") == "KILL_SWITCH_ACTIVE"
+    tomorrow = day + dt.timedelta(days=1)
+    assert not rm.check_daily_drawdown(tomorrow, 97_000, 97_000).tripped
+    assert rm.entry_block_reason("SPY", tomorrow, [], [], [], "id") is None
+
+
+def test_kill_switch_on_simulated_consecutive_full_losses():
+    """Four 1R losers in a day: the switch must stay off after three and trip on the fourth."""
+    rm = RiskManager(RiskConfig(), StrategyConfig())
+    day, start = dt.date(2026, 10, 12), 100_000.0
+    equity, tripped_after = start, None
+    for n in range(1, 6):
+        size = rm.size_position(equity, entry_ref=50.0, atr=2.5)
+        equity -= size.shares * size.stop_distance        # stopped out at exactly the stop
+        if rm.check_daily_drawdown(day, start, equity).tripped and tripped_after is None:
+            tripped_after = n
+    assert tripped_after == 4
+
+
+def test_idempotency_gates():
+    rm = RiskManager(RiskConfig(max_open_positions=2), StrategyConfig())
+    day = dt.date(2026, 10, 12)
+    cid = client_order_id("tpb1", "SPY", pd.Timestamp("2026-10-12 10:30", tz=ET.zone))
+    assert cid == "tpb1-SPY-20261012T1030"
+    assert rm.entry_block_reason("SPY", day, ["SPY"], [], [], cid) == "POSITION_ALREADY_OPEN"
+    assert rm.entry_block_reason("SPY", day, [], ["SPY"], [], cid) == "OPEN_ORDER_EXISTS"
+    assert rm.entry_block_reason("SPY", day, [], [], [cid], cid) == "DUPLICATE_CLIENT_ORDER_ID"
+    assert rm.entry_block_reason("SPY", day, ["QQQ", "AAPL"], [], [], cid) == "MAX_OPEN_POSITIONS"
+    assert rm.entry_block_reason("SPY", day, ["QQQ"], ["AAPL"], ["other"], cid) is None
+
+
+def test_r_multiple():
+    assert r_multiple(100.0, 103.0, 98.0) == pytest.approx(1.5)
+    assert r_multiple(100.0, 98.0, 98.0) == pytest.approx(-1.0)
+    assert r_multiple(97.0, 96.0, 98.0, planned_risk=2.0) == pytest.approx(-0.5)  # gapped through the stop
+
+
+# ============================================================================ sessions
+def _source_bars_for_day(day: str = "2026-07-15") -> pd.DataFrame:
+    start = pd.Timestamp(f"{day} 04:00", tz=ET.zone)
+    idx = pd.date_range(start, periods=32, freq="30min")              # 04:00 .. 19:30 ET
+    values = np.arange(len(idx), dtype=float) + 100
+    df = pd.DataFrame({"open": values, "high": values + 0.5, "low": values - 0.5, "close": values + 0.25,
+                       "volume": 1_000.0}, index=idx.tz_convert("UTC"))
+    return df
+
+
+def test_session_bars_are_aligned_and_drop_extended_hours():
+    src = _source_bars_for_day()
+    bars = to_session_bars(src)
+    starts = [f"{t:%H:%M}" for t in bars.index]
+    assert starts == ["09:30", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30"]
+    first = bars.iloc[0]
+    src_et = src.tz_convert(ET.zone)
+    open_930, bar_1000 = src_et.loc[src_et.index.strftime("%H:%M") == "09:30"].iloc[0], \
+        src_et.loc[src_et.index.strftime("%H:%M") == "10:00"].iloc[0]
+    assert first["open"] == open_930["open"] and first["close"] == bar_1000["close"]
+    assert first["high"] == max(open_930["high"], bar_1000["high"]) and first["volume"] == 2_000.0
+    assert f"{bars['bar_end'].iloc[-1]:%H:%M}" == "16:00" and bars["n_expected"].iloc[-1] == 1
+    assert bars["n_source"].eq(bars["n_expected"]).all()
+
+
+def test_complete_bars_drops_forming_and_partial_bars():
+    bars = to_session_bars(_source_bars_for_day())
+    at = lambda hhmm: pd.Timestamp(f"2026-07-15 {hhmm}", tz=ET.zone)  # noqa: E731
+    assert len(complete_bars(bars, at("10:29:59"))) == 0
+    assert len(complete_bars(bars, at("10:30:05"))) == 1
+    assert len(complete_bars(bars, at("16:00:01"))) == 7
+    partial = bars.copy()
+    partial.loc[partial.index[1], "n_source"] = 1                     # 11:00 source bar not published yet
+    assert len(complete_bars(partial, at("11:30:30"), grace_seconds=120)) == 1
+    assert len(complete_bars(partial, at("11:32:30"), grace_seconds=120)) == 2
+
+
+def test_trading_window_is_eastern_time_and_dst_safe():
+    def utc(s):
+        return pd.Timestamp(s, tz="UTC")
+    assert in_trading_window(utc("2026-07-15 13:45"))        # 09:45 EDT
+    assert not in_trading_window(utc("2026-07-15 13:44"))    # 09:44 EDT
+    assert in_trading_window(utc("2026-07-15 19:45"))        # 15:45 EDT
+    assert not in_trading_window(utc("2026-07-15 19:46"))
+    assert in_trading_window(utc("2026-01-15 14:45"))        # 09:45 EST
+    assert not in_trading_window(utc("2026-01-15 13:45"))    # 08:45 EST
+    assert not in_trading_window(utc("2026-07-18 15:00"))    # Saturday
+    with pytest.raises(ValueError):
+        in_trading_window(pd.Timestamp("2026-07-15 10:00"))
+    assert latest_bar_end(pd.Timestamp("2026-07-15 10:30:10", tz=ET.zone), 20) is None
+    assert f"{latest_bar_end(pd.Timestamp('2026-07-15 10:30:25', tz=ET.zone), 20):%H:%M}" == "10:30"
+    assert f"{latest_bar_end(pd.Timestamp('2026-07-15 15:59', tz=ET.zone), 20):%H:%M}" == "15:30"
+
+
+# ============================================================================ journal
+def test_journal_schema_append_and_reload(tmp_path, signals):
+    path = tmp_path / "journal.csv"
+    journal = TradeJournal(str(path))
+    journal.log(J.STARTUP, equity=100_000.0)
+    row = signals[signals["entry"]].iloc[0]
+    journal.log_bar_check("SYN", row, row.name, LONG, R_ENTRY, describe(row, CFG), "ENTER", False,
+                          equity=100_000.0)
+    with pytest.raises(ValueError):
+        journal.log(J.ERROR, not_a_column=1)
+    df = read_journal(str(path))
+    assert list(df.columns) == COLUMNS and len(df) == 2
+    check = df.iloc[1]
+    assert check["state"] == LONG and check["reason_code"] == R_ENTRY
+    assert check["rsi"] == pytest.approx(row["rsi"]) and check["decision_bar_et"] == row.name
+    assert "crossed" in check["reason_detail"]
+    TradeJournal(str(path)).log(J.SHUTDOWN)                      # reopening appends, no new header
+    assert len(read_journal(str(path))) == 3
+
+
+def test_journal_rotates_on_schema_change(tmp_path):
+    path = tmp_path / "journal.csv"
+    path.write_text("old,header\n1,2\n")
+    TradeJournal(str(path)).log(J.STARTUP)
+    assert list(read_journal(str(path)).columns) == COLUMNS
+    assert len(list(tmp_path.glob("journal.schema-*.csv"))) == 1
+
+
+def test_slippage_sign_convention():
+    assert slippage_bps("buy", 100.0, 100.05) == pytest.approx(5.0)
+    assert slippage_bps("sell", 100.0, 99.95) == pytest.approx(5.0)
+    assert slippage_bps("sell", 100.0, 100.10) == pytest.approx(-10.0)
+
+
+# ============================================================================ backtester
+@pytest.fixture(scope="module")
+def portfolio() -> dict[str, pd.DataFrame]:
+    """Five synthetic symbols with a noisier bull regime, so the backtest sees losers too."""
+    return {f"SYN{seed}": make_synthetic_ohlcv(seed, bull_noise=0.006, bull_drift=0.0025)
+            for seed in (7, 1, 2, 3, 4)}
+
+
+@pytest.fixture(scope="module")
+def backtest_result(portfolio):
+    return Backtester().run({s: df[OHLC + ["volume"]] for s, df in portfolio.items()})
+
+
+def test_backtester_end_to_end_tear_sheet(backtest_result, capsys):
+    sheet = format_tear_sheet(backtest_result, "SYNTHETIC MULTI-REGIME TEAR SHEET (not market evidence)")
+    with capsys.disabled():
+        print("\n" + sheet)
+    m = backtest_result.metrics
+    assert m["n_trades"] > 0
+    for key in ("sharpe", "sortino", "profit_factor", "max_drawdown", "expectancy_r", "total_return", "cagr"):
+        assert key in m and np.isfinite(m[key]), key
+    assert m["max_drawdown"] <= 0
+    for label in ("Sharpe", "Sortino", "Profit factor", "Max drawdown", "Expectancy", "Walk-forward folds"):
+        assert label in sheet
+    assert len(backtest_result.folds) == BacktestConfig().n_folds
+    assert backtest_result.equity.notna().all()
+    assert set(backtest_result.trades["exit_reason"]) >= {"STOP_LOSS", "TAKE_PROFIT", "EMA_EXIT"}
+
+
+def test_backtester_charges_slippage_on_both_sides(backtest_result):
+    trades = backtest_result.trades
+    np.testing.assert_allclose(trades["entry_fill"], trades["entry_raw"] * 1.0005)
+    np.testing.assert_allclose(trades["exit_fill"], trades["exit_raw"] * 0.9995)
+    assert (trades["slippage_cost"] > 0).all()
+
+
+def test_backtester_trades_follow_the_rules(backtest_result, portfolio):
+    trades = backtest_result.trades
+    for _, trade in trades.iterrows():
+        df = portfolio[trade["symbol"]]
+        sig = generate_signals(df[OHLC], CFG)
+        row = sig.loc[trade["entry_time"]]
+        assert row["entry"], "entered without a signal"
+        assert in_trading_window(trade["entry_time"]), "entered outside 09:45-15:45 ET"
+        assert df.loc[trade["entry_time"], "regime"] == "BULL"
+        assert trade["entry_raw"] == df.loc[trade["entry_time"], "open"]
+        assert trade["stop"] == pytest.approx(round(row["close"] - 2.0 * row["atr"], 2))
+        assert trade["take_profit"] == pytest.approx(round(row["close"] + 3.0 * row["atr"], 2))
+        assert trade["risk_pct"] <= 0.01 + 1e-9 and trade["notional_pct"] <= 0.20 + 1e-9
+        if trade["exit_reason"] == "STOP_LOSS":
+            assert trade["exit_raw"] == trade["stop"]
+        if trade["exit_reason"] == "TAKE_PROFIT":
+            assert trade["exit_raw"] == trade["take_profit"]
+
+
+def test_backtester_kill_switch_flattens_and_halts(portfolio):
+    tight = RiskConfig(max_daily_drawdown=0.001)
+    result = Backtester(risk_cfg=tight).run({s: df[OHLC] for s, df in portfolio.items()})
+    assert result.metrics["kill_switch_events"] > 0
+    trades = result.trades
+    assert (trades["exit_reason"] == "KILL_SWITCH").any(), "open positions must be flattened on a trip"
+    for event in result.events:
+        t, day = event["time"], event["time"].tz_convert(ET.zone).date()
+        assert event["daily_pnl_pct"] <= -0.001
+        still_open = trades[(trades["entry_time"] <= t) & (trades["exit_time"] > t)]
+        assert still_open.empty, "nothing may stay open after the kill-switch trips"
+        later = trades[(trades["entry_time"] > t) & (trades["entry_time"].dt.tz_convert(ET.zone).dt.date == day)]
+        assert later.empty, "entries must stay blocked for the rest of the day"
+
+
+# ============================================================================ live bot (fake broker)
+class FakeBroker:
+    """In-memory stand-in for AlpacaClient: fills market orders at the last close + 3 bps
+    and works bracket legs against the synthetic bars as time advances."""
+
+    paper = True
+
+    def __init__(self, bars: dict[str, pd.DataFrame], equity: float = 100_000.0):
+        self.bars, self.equity, self.last_equity = bars, equity, equity
+        self.now = None
+        self.market_open = True
+        self.positions, self.orders, self.submitted, self.closed = {}, {}, [], []
+        self.flattened = 0
+        self._n = 0
+
+    def _order(self, **kw):
+        self._n += 1
+        order = SimpleNamespace(id=f"ord-{self._n}", legs=[], stop_price=None, limit_price=None, filled_at=None,
+                                filled_avg_price=None, filled_qty=0, client_order_id=None, **kw)
+        self.orders[order.id] = order
+        return order
+
+    def _last_close(self, symbol):
+        return float(complete_bars(self.bars[symbol], self.now)["close"].iloc[-1])
+
+    def _fill(self, order, price):
+        order.status, order.filled_avg_price, order.filled_qty, order.filled_at = "filled", price, order.qty, \
+            self.now.to_pydatetime()
+
+    def _work_brackets(self):
+        for symbol, pos in list(self.positions.items()):
+            done = complete_bars(self.bars[symbol], self.now)
+            done = done[done["bar_end"] > pos.opened]
+            legs = [o for o in self.orders.values() if o.symbol == symbol and o.status in ("new", "held")]
+            stop = next((o for o in legs if o.order_type == "stop"), None)
+            target = next((o for o in legs if o.order_type == "limit"), None)
+            for _, bar in done.iterrows():
+                hit = (stop, stop.stop_price) if stop and bar["low"] <= stop.stop_price else \
+                      (target, target.limit_price) if target and bar["high"] >= target.limit_price else None
+                if hit:
+                    self._fill(hit[0], hit[1])
+                    for leg in legs:
+                        if leg is not hit[0]:
+                            leg.status = "canceled"
+                    del self.positions[symbol]
+                    break
+
+    # --- AlpacaClient interface
+    def get_clock(self):
+        return SimpleNamespace(is_open=self.market_open, timestamp=self.now, next_open=self.now + pd.Timedelta(hours=12))
+
+    def get_account(self):
+        return SimpleNamespace(equity=str(self.equity), last_equity=str(self.last_equity),
+                               buying_power=str(4 * self.equity), trading_blocked=False, account_blocked=False)
+
+    def get_positions(self):
+        self._work_brackets()
+        return dict(self.positions)
+
+    def get_open_orders(self, symbols=None):
+        return [o for o in self.orders.values() if o.status in ("new", "held") and (not symbols or o.symbol in symbols)]
+
+    def fetch_session_bars(self, symbols, start, end, now=None):
+        return {s: complete_bars(self.bars[s], now) for s in symbols}
+
+    def submit_bracket_order(self, symbol, qty, stop_price, take_profit, client_order_id):
+        existing = [o for o in self.orders.values() if o.client_order_id == client_order_id]
+        if existing:
+            return existing[0]
+        order = self._order(symbol=symbol, qty=qty, side="buy", order_type="market", status="new")
+        order.client_order_id = client_order_id
+        self._fill(order, round(self._last_close(symbol) * 1.0003, 4))
+        self._order(symbol=symbol, qty=qty, side="sell", order_type="stop", status="held").stop_price = stop_price
+        self._order(symbol=symbol, qty=qty, side="sell", order_type="limit", status="new").limit_price = take_profit
+        self.positions[symbol] = SimpleNamespace(symbol=symbol, qty=str(qty), avg_entry_price=str(order.filled_avg_price),
+                                                 opened=self.now)
+        self.submitted.append(dict(symbol=symbol, qty=qty, stop=stop_price, target=take_profit, cid=client_order_id))
+        return order
+
+    def wait_for_terminal(self, order_id, timeout=None):
+        return self.orders[order_id]
+
+    def get_order_by_client_id(self, client_order_id):
+        return next(o for o in self.orders.values() if o.client_order_id == client_order_id)
+
+    def bracket_levels(self, symbol):
+        legs = self.get_open_orders([symbol])
+        stop = next((o.stop_price for o in legs if o.order_type == "stop"), None)
+        target = next((o.limit_price for o in legs if o.order_type == "limit"), None)
+        return stop, target
+
+    def close_position(self, symbol):
+        if symbol not in self.positions:
+            return None
+        for order in self.get_open_orders([symbol]):
+            order.status = "canceled"
+        pos = self.positions.pop(symbol)
+        order = self._order(symbol=symbol, qty=float(pos.qty), side="sell", order_type="market", status="new")
+        self._fill(order, round(self._last_close(symbol) * 0.9997, 4))
+        self.closed.append(symbol)
+        return order
+
+    def flatten_all(self):
+        self.flattened += 1
+        for symbol in list(self.positions):
+            self.close_position(symbol)
+
+    def find_latest_fill(self, symbol, side, since):
+        fills = [o for o in self.orders.values() if o.symbol == symbol and o.side == side and o.status == "filled"
+                 and o.filled_at >= since]
+        return max(fills, key=lambda o: o.filled_at) if fills else None
+
+
+def _decision_times(bars: pd.DataFrame, start: int, stop: int) -> list[pd.Timestamp]:
+    """Moments the live bot evaluates: 25s after each hourly close inside the trading window."""
+    times = [end + pd.Timedelta(seconds=25) for end in bars["bar_end"].iloc[start:stop]]
+    return [t for t in times if in_trading_window(t)]
+
+
+@pytest.fixture()
+def live_setup(tmp_path, synthetic, signals):
+    bars = with_session_columns(synthetic)
+    broker = FakeBroker({"SYN": bars})
+    journal = TradeJournal(str(tmp_path / "journal.csv"))
+    first_long = next(i for i in np.flatnonzero(signals["entry"].to_numpy()) if in_trading_window(signals.index[i]))
+    return bars, broker, journal, first_long
+
+
+def _make_bot(broker, journal, symbols=("SYN",), **kw):
+    return TradingBot(broker, journal, list(symbols), CFG, RiskConfig(), ExecutionConfig(),
+                      now_fn=lambda: broker.now, sleep=lambda s: None, **kw)
+
+
+def _step(bot, broker, when):
+    broker.now = when
+    return bot.run_once(when)
+
+
+def test_bot_enters_once_with_exact_bracket_and_survives_restart(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal)
+    when = signals.index[t] + pd.Timedelta(seconds=25)
+    broker.now = when
+    bot.bootstrap()
+    assert _step(bot, broker, when) == "EVALUATED"
+
+    sig = signals.iloc[t]
+    expected = RiskManager(RiskConfig(), CFG).size_position(100_000.0, sig["close"], sig["atr"],
+                                                            buying_power=400_000.0)
+    assert len(broker.submitted) == 1
+    order = broker.submitted[0]
+    assert order["qty"] == expected.shares and order["stop"] == expected.stop_price
+    assert order["target"] == expected.take_profit
+    assert order["cid"] == client_order_id("tpb1", "SYN", signals.index[t])
+
+    log = read_journal(journal.path)
+    check = log[log["event"] == J.BAR_CHECK].iloc[-1]
+    assert check["state"] == LONG and check["action"] == "ENTER"
+    fill = log[log["event"] == J.ENTRY_FILL].iloc[-1]
+    assert fill["slippage_bps"] == pytest.approx(3.0, abs=0.05)
+
+    assert _step(bot, broker, when + pd.Timedelta(seconds=30)) == "IDLE"   # same bar: nothing new
+    restarted = _make_bot(broker, journal)                                   # crash + restart mid-bar
+    restarted.bootstrap()
+    assert "SYN" in restarted.trades
+    _step(restarted, broker, when + pd.Timedelta(seconds=60))
+    assert len(broker.submitted) == 1, "restart must not duplicate the entry"
+
+
+def test_bot_blocks_outside_window_and_when_closed(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal)
+    opening = signals.index[t].normalize() + pd.Timedelta(hours=9, minutes=35)
+    assert _step(bot, broker, opening) == "OUTSIDE_WINDOW"
+    broker.market_open = False
+    assert _step(bot, broker, signals.index[t] + pd.Timedelta(seconds=25)) == "MARKET_CLOSED"
+    assert broker.submitted == []
+
+
+def test_bot_dry_run_sends_no_orders(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal, dry_run=True)
+    _step(bot, broker, signals.index[t] + pd.Timedelta(seconds=25))
+    assert broker.submitted == []
+    assert read_journal(journal.path)["action"].eq("DRY_RUN_ENTER").any()
+
+
+def test_bot_trailing_ema_exit_and_bracket_reconciliation(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal)
+    for when in _decision_times(bars, t - 1, t + 300):
+        _step(bot, broker, when)
+        if broker.submitted and "SYN" not in broker.positions:
+            break
+    log = read_journal(journal.path)
+    exits = log[log["event"] == J.EXIT_FILL]
+    assert len(exits) == 1
+    exit_row = exits.iloc[0]
+    assert exit_row["exit_reason"] in {"EMA_EXIT", "STOP_LOSS", "TAKE_PROFIT"}
+    if exit_row["exit_reason"] == "STOP_LOSS":
+        assert exit_row["r_multiple"] == pytest.approx(-1.0, abs=0.02)
+    if exit_row["exit_reason"] == "TAKE_PROFIT":
+        assert exit_row["r_multiple"] > 1.0
+    if exit_row["exit_reason"] == "EMA_EXIT":
+        assert broker.closed == ["SYN"]
+        trigger = log[(log["event"] == J.BAR_CHECK) & (log["state"] == EXIT)].iloc[-1]
+        assert trigger["close"] < trigger["ema_fast"]
+    holds = log[(log["event"] == J.BAR_CHECK) & (log["in_position"].astype(str) == "True")]
+    assert (holds["state"] != LONG).all()
+
+
+def test_bot_stop_fill_is_reconciled_as_minus_one_r(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal)
+    when = signals.index[t] + pd.Timedelta(seconds=25)
+    _step(bot, broker, when)
+    stop_leg = next(o for o in broker.orders.values() if o.order_type == "stop")
+    broker.now = when + pd.Timedelta(minutes=5)
+    broker._fill(stop_leg, stop_leg.stop_price)          # stop triggers between heartbeats
+    del broker.positions["SYN"]
+    _step(bot, broker, when + pd.Timedelta(minutes=5))
+    exit_row = read_journal(journal.path).query("event == @J.EXIT_FILL").iloc[-1]
+    assert exit_row["exit_reason"] == "STOP_LOSS"
+    entry = bot.journal.read().query("event == @J.ENTRY_FILL").iloc[-1]
+    assert exit_row["r_multiple"] == pytest.approx(-1.0)
+    assert exit_row["pnl"] == pytest.approx(entry["qty"] * (stop_leg.stop_price - entry["fill_price"]))
+
+
+def test_bot_journals_a_stop_that_fills_mid_cycle_before_deciding(live_setup, signals):
+    """The stop fills between the heartbeat check and the bar evaluation: the exit must be
+    journaled first and the decision must see the symbol as flat."""
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal)
+    when = signals.index[t] + pd.Timedelta(seconds=25)
+    _step(bot, broker, when)
+    stop_leg = next(o for o in broker.orders.values() if o.order_type == "stop")
+    original, calls = broker.get_positions, {"n": 0}
+
+    def positions_then_stop():
+        calls["n"] += 1
+        if calls["n"] == 2:                       # second call of the cycle, after bars were fetched
+            broker._fill(stop_leg, stop_leg.stop_price)
+            broker.positions.pop("SYN", None)
+        return original()
+
+    broker.get_positions = positions_then_stop
+    next_when = next(w for w in _decision_times(bars, t, t + 20) if w > when)
+    _step(bot, broker, next_when)
+    log = read_journal(journal.path)
+    tail = log[log["ts_utc"] == next_when]
+    assert list(tail["event"])[:2] == [J.EXIT_FILL, J.BAR_CHECK]
+    assert tail.iloc[0]["exit_reason"] == "STOP_LOSS"
+    assert tail.iloc[1]["in_position"] in (False, "False") and "SYN" not in bot.trades
+
+
+def test_bot_kill_switch_flattens_and_blocks_entries(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal)
+    when = signals.index[t] + pd.Timedelta(seconds=25)
+    _step(bot, broker, when)
+    assert "SYN" in broker.positions
+    broker.equity = 96_900.0                              # -3.1% vs previous close
+    _step(bot, broker, when + pd.Timedelta(seconds=30))
+    log = read_journal(journal.path)
+    assert (log["event"] == J.KILL_SWITCH).sum() == 1 and broker.flattened == 1
+    assert "SYN" not in broker.positions
+    assert log.query("event == @J.EXIT_FILL").iloc[-1]["exit_reason"] == "KILL_SWITCH"
+    bot.last_decision_bar.clear()
+    bot.last_processed_end = None
+    _step(bot, broker, when + pd.Timedelta(seconds=60))   # same bar re-evaluated after the trip
+    blocked = read_journal(journal.path).query("event == @J.BAR_CHECK").iloc[-1]
+    assert blocked["action"] == "BLOCKED_KILL_SWITCH_ACTIVE"
+    assert len(broker.submitted) == 1
+
+
+def test_live_bot_reproduces_every_backtest_trade(portfolio, tmp_path):
+    """Full lifecycle parity: the live bot (fake broker) must enter on the same bar, with the
+    same bracket, and exit for the same reason as the backtester, trade after trade."""
+    compared = set()
+    for symbol in ("SYN7", "SYN1", "SYN2"):
+        df = portfolio[symbol]
+        bars = with_session_columns(df)
+        trades = Backtester().run({symbol: df[OHLC]}).trades
+        for n, trade in trades[trades["exit_reason"] != "END_OF_DATA"].iterrows():
+            broker = FakeBroker({symbol: bars})
+            journal = TradeJournal(str(tmp_path / f"{symbol}-{n}.csv"))
+            bot = _make_bot(broker, journal, symbols=[symbol])
+            start = bars.index.get_loc(trade["entry_time"])
+            exit_bar = bars.index.get_loc(trade["exit_time"])
+            for when in _decision_times(bars, start - 1, exit_bar + 8):
+                _step(bot, broker, when)
+                if broker.submitted and symbol not in broker.positions:
+                    break
+            log = read_journal(journal.path)
+            entry = log[log["event"] == J.ENTRY_FILL].iloc[0]
+            exit_row = log[log["event"] == J.EXIT_FILL].iloc[0]
+            assert entry["ts_utc"] == trade["entry_time"] + pd.Timedelta(seconds=25)
+            assert entry["stop_price"] == pytest.approx(trade["stop"])
+            assert entry["take_profit"] == pytest.approx(trade["take_profit"])
+            assert exit_row["exit_reason"] == trade["exit_reason"].replace("_GAP", ""), (symbol, n)
+            if trade["exit_reason"] == "EMA_EXIT":
+                assert exit_row["ts_utc"] == trade["exit_time"] + pd.Timedelta(seconds=25)
+            compared.add(trade["exit_reason"].replace("_GAP", ""))
+    assert compared >= {"STOP_LOSS", "TAKE_PROFIT", "EMA_EXIT"}
+
+
+# ============================================================================ alpaca wrapper (offline)
+def test_bracket_order_request_is_gtc_bracket():
+    from src.alpaca_client import build_bracket_order
+
+    fields = build_bracket_order("SPY", 10, 495.5, 512.25, "tpb1-SPY-20261012T1030").to_request_fields()
+    assert fields["order_class"].value == "bracket" and fields["time_in_force"].value == "gtc"
+    assert fields["side"].value == "buy" and fields["type"].value == "market" and fields["qty"] == 10
+    assert fields["stop_loss"] == {"stop_price": 495.5} and fields["take_profit"] == {"limit_price": 512.25}
+    assert fields["client_order_id"] == "tpb1-SPY-20261012T1030"
+
+
+def _api_error(status: int, message: str = "boom"):
+    from alpaca.common.exceptions import APIError
+
+    return APIError(json.dumps({"code": status * 100000, "message": message}),
+                    SimpleNamespace(response=SimpleNamespace(status_code=status), request=None))
+
+
+def test_retry_policy_backs_off_on_transient_errors_only():
+    from src.alpaca_client import with_retries
+
+    delays, calls = [], {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("reset")
+        if calls["n"] == 2:
+            raise _api_error(503)
+        if calls["n"] == 3:
+            raise _api_error(429)
+        return "ok"
+
+    assert with_retries(flaky, "flaky", max_retries=5, base_delay=1.0, sleep=delays.append) == "ok"
+    assert len(delays) == 3 and delays[0] < delays[2] <= 4.0      # exponential with jitter, capped
+    calls["n"] = 0
+
+    def forbidden():
+        calls["n"] += 1
+        raise _api_error(403, "forbidden")
+
+    with pytest.raises(Exception):
+        with_retries(forbidden, "forbidden", sleep=delays.append)
+    assert calls["n"] == 1, "4xx business errors must not be retried"
+    with pytest.raises(ConnectionError):
+        with_retries(lambda: (_ for _ in ()).throw(ConnectionError("down")), "down", max_retries=2,
+                     sleep=lambda s: None)
+
+
+def test_duplicate_client_order_id_returns_existing_order():
+    from src.alpaca_client import AlpacaClient
+
+    existing = SimpleNamespace(id="abc", client_order_id="tpb1-SPY-20261012T1030")
+
+    class Trading:
+        def submit_order(self, request):
+            raise _api_error(422, "client_order_id must be unique")
+
+        def get_order_by_client_id(self, cid):
+            return existing
+
+    client = AlpacaClient("k", "s", True, ExecutionConfig(), trading=Trading(), data=object(), sleep=lambda s: None)
+    assert client.submit_bracket_order("SPY", 1, 99.0, 103.0, existing.client_order_id) is existing
+
+
+def test_fetch_session_bars_from_alpaca_barset():
+    from alpaca.data.models.bars import BarSet
+
+    from src.alpaca_client import AlpacaClient
+
+    src = _source_bars_for_day()
+    raw = {"SPY": [{"t": ts.isoformat().replace("+00:00", "Z"), "o": r.open, "h": r.high, "l": r.low,
+                    "c": r.close, "v": r.volume, "n": 1, "vw": r.close} for ts, r in src.iterrows()]}
+
+    class Data:
+        def get_stock_bars(self, request):
+            assert request.feed.value == "iex" and request.adjustment.value == "all"
+            return BarSet(raw)
+
+    client = AlpacaClient("k", "s", True, ExecutionConfig(data_feed="iex"), trading=object(), data=Data())
+    now = pd.Timestamp("2026-07-15 12:31", tz=ET.zone)
+    bars = client.fetch_session_bars(["SPY", "QQQ"], now - pd.Timedelta(days=1), now, now=now)
+    assert [f"{t:%H:%M}" for t in bars["SPY"].index] == ["09:30", "10:30", "11:30"]
+    assert bars["QQQ"].empty
+    pd.testing.assert_frame_equal(bars["SPY"], complete_bars(to_session_bars(src), now), check_freq=False)
+
+
+# ============================================================================ trust evaluation
+def test_evaluate_trust_on_simulated_three_weeks(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal)
+    broker.now = signals.index[t]
+    bot.bootstrap()
+    for when in _decision_times(bars, t - 1, t - 1 + 15 * 7):           # 15 trading days
+        _step(bot, broker, when)
+    df = read_journal(journal.path)
+    checks, verdict = evaluate_trust.evaluate(df, ["SYN"])
+    status = {c.name: c.status for c in checks}
+    assert status["Bar-check coverage"] == "PASS"
+    assert status["Decision latency after bar close"] == "PASS"
+    assert status["Duplicate order submissions"] == "PASS"
+    assert status["Entries while already in position"] == "PASS"
+    assert status["Overlapping positions per symbol"] == "PASS"
+    assert status["Every entry has a stop below the fill"] == "PASS"
+    assert status["Per-trade risk <= limit"] == "PASS"
+    assert status["Expectancy"] in {"INCONCLUSIVE"}                    # far fewer than 30 trades
+    assert verdict.startswith("NOT READY")
+    report = evaluate_trust.format_report(checks, verdict, journal.path, df)
+    assert "VERDICT" in report
+
+
+def test_evaluate_trust_flags_duplicate_orders():
+    rows = [{"event": J.ORDER_SUBMITTED, "symbol": "SPY", "client_order_id": "x"},
+            {"event": J.ORDER_SUBMITTED, "symbol": "SPY", "client_order_id": "x"}]
+    df = pd.DataFrame(rows).reindex(columns=COLUMNS)
+    status = {c.name: c.status for c in evaluate_trust.check_idempotency(df)}
+    assert status["Duplicate order submissions"] == "FAIL"
+
+
+def test_gitignore_protects_secrets_and_outputs():
+    lines = open(".gitignore").read().split()
+    for pattern in (".env", "*.log", "*.csv", ".venv/", "__pycache__/"):
+        assert pattern in lines
