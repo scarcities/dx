@@ -8,6 +8,7 @@
 *.csv
 *.csv.gz
 !earnings_calendar.example.csv
+!backtest_ledger.csv
 logs/
 bars/
 

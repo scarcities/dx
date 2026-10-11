@@ -711,6 +711,10 @@ def test_cluster_random_drop_null_keeps_exactly_k_signals():
     # any filter look like it beats "random").
     assert cluster_random_drop_percentile(r, weeks, overall + 1e-9, k=19, draws=500) < 0.9
     assert 0.0 < cluster_random_drop_percentile(r, weeks, overall, k=10, draws=500) < 1.0
+    spread = np.tile([1, 2, 3, 4], 5)                    # good and bad signals in every week
+    top, bottom = np.sort(r)[-10:].mean(), np.sort(r)[:10].mean()
+    assert cluster_random_drop_percentile(r, spread, top, k=10, draws=500) > 0.95     # keeps the best
+    assert cluster_random_drop_percentile(r, spread, bottom, k=10, draws=500) < 0.05  # keeps the worst
 
 
 def test_take_profit_needs_a_trade_through(portfolio):
@@ -1148,55 +1152,74 @@ def test_live_bot_reproduces_every_backtest_trade(portfolio, tmp_path, name, req
     assert compared >= required
 
 
-def test_bot_earnings_blocks_entry_and_forces_exit(live_setup, signals, tmp_path):
+def test_bot_earnings_blocks_entry(live_setup, signals):
     bars, broker, journal, t = live_setup
     decision = signals.index[t]
-    day = decision.date()
-    blocked = _make_bot(broker, journal, calendar={"SYN": [(day, "AMC")]})       # entry day inside the window
+    blocked = _make_bot(broker, journal, calendar={"SYN": [(decision.date(), "AMC")]})   # entry day in window
     _step(blocked, broker, decision + pd.Timedelta(seconds=25))
     row = read_journal(journal.path).query("event == @J.BAR_CHECK").iloc[-1]
     assert row["state"] == WAIT and row["reason_code"] == R_EARNINGS and broker.submitted == []
 
-    sessions = sorted(set(bars.index.date))
-    event = sessions[sessions.index(day) + 2]                     # AMC two sessions out: entry day is clear
-    broker2 = FakeBroker({"SYN": bars})
-    journal2 = TradeJournal(str(tmp_path / "earnings2.csv"))
-    bot = _make_bot(broker2, journal2, calendar={"SYN": [(event, "AMC")]})
-    deadline = pd.Timestamp(f"{event} 14:30", tz=ET.zone)
-    for when in _decision_times(bars, t - 1, t + 40):
-        _step(bot, broker2, when)
-        if when > deadline + pd.Timedelta(minutes=5) or (broker2.submitted and "SYN" not in broker2.positions):
-            break
-    exits = read_journal(journal2.path).query("event == @J.EXIT_FILL")
-    assert len(exits) == 1
-    if exits.iloc[0]["exit_reason"] == "EARNINGS_EXIT":
-        assert exits.iloc[0]["ts_utc"] == deadline + pd.Timedelta(seconds=25)
-    else:                                   # the bracket closed it before the deadline
-        assert exits.iloc[0]["ts_utc"] < deadline
+
+# SYN2 (noisy portfolio) buys 2023-05-23 11:30 and is still open on 2023-05-25 at 14:30.
+EARNINGS_CASE = dict(symbol="SYN2", entry="2023-05-23 11:30", event="2023-05-25")
 
 
-def test_bot_earnings_exit_does_not_need_market_data(live_setup, signals, tmp_path):
-    """Market data fails from the morning of the last hold day: the exit still happens at 14:30."""
-    bars, broker, journal, t = live_setup
-    sessions = sorted(set(bars.index.date))
-    day = signals.index[t].date()
-    event = sessions[sessions.index(day) + 2]
-    bot = _make_bot(broker, journal, calendar={"SYN": [(event, "AMC")]})
-    deadline = pd.Timestamp(f"{event} 14:30", tz=ET.zone)
-    for when in _decision_times(bars, t - 1, t + 40):
-        broker.fail_fetch = when.date() >= event
+class HalfDayBroker(FakeBroker):
+    """Reports a 13:00 close for the given sessions, like Alpaca's calendar on half days."""
+
+    def __init__(self, bars, half_days):
+        super().__init__(bars)
+        self.half_days = set(half_days)
+
+    def get_session_closes(self, start, end):
+        closes = super().get_session_closes(start, end)
+        return {d: ("13:00" if d in self.half_days else c) for d, c in closes.items()}
+
+
+def _run_earnings_case(portfolio, tmp_path, half_day=False, fetch_fails_on_event_day=False):
+    case = EARNINGS_CASE
+    event = pd.Timestamp(case["event"]).date()
+    df = portfolio[case["symbol"]]
+    if half_day:                                             # drop 13:30-15:30 on the event session
+        local = df.index
+        df = df[~((local.date == event) & (local.hour * 60 + local.minute > 12 * 60 + 30))]
+    bars = with_session_columns(df)
+    broker = HalfDayBroker({case["symbol"]: bars}, [event] if half_day else [])
+    journal = TradeJournal(str(tmp_path / f"earn-{half_day}-{fetch_fails_on_event_day}.csv"))
+    calendar = {case["symbol"]: [(event, "AMC")]}
+    bot = _make_bot(broker, journal, symbols=[case["symbol"]], calendar=calendar)
+    start = bars.index.get_loc(pd.Timestamp(case["entry"], tz=ET.zone))
+    for when in _decision_times(bars, start - 1, start + 30):
+        broker.fail_fetch = fetch_fails_on_event_day and when.date() >= event
         try:
             _step(bot, broker, when)
         except ConnectionError:
-            pass                                   # run_forever logs this and carries on
-        if broker.submitted and "SYN" not in broker.positions or when > deadline + pd.Timedelta(minutes=5):
+            pass                                             # run_forever logs this and carries on
+        if broker.submitted and case["symbol"] not in broker.positions:
             break
-    exits = read_journal(journal.path).query("event == @J.EXIT_FILL")
-    assert len(exits) == 1
-    if exits.iloc[0]["exit_reason"] == "EARNINGS_EXIT":
-        assert exits.iloc[0]["ts_utc"] == deadline + pd.Timedelta(seconds=25)
-    else:
-        assert exits.iloc[0]["ts_utc"] < deadline
+    backtest_trades = Backtester(calendar=calendar).run({case["symbol"]: df[OHLC]}).trades
+    return read_journal(journal.path), backtest_trades
+
+
+@pytest.mark.parametrize("fetch_fails", [False, True], ids=["normal", "market-data-outage"])
+def test_bot_earnings_forced_exit_matches_backtest(portfolio, tmp_path, fetch_fails):
+    log, trades = _run_earnings_case(portfolio, tmp_path, fetch_fails_on_event_day=fetch_fails)
+    deadline = pd.Timestamp(f"{EARNINGS_CASE['event']} 14:30", tz=ET.zone)
+    exit_row = log.query("event == @J.EXIT_FILL").iloc[-1]
+    assert exit_row["exit_reason"] == "EARNINGS_EXIT"
+    assert exit_row["ts_utc"] == deadline + pd.Timedelta(seconds=25)
+    twin = trades[trades["entry_time"] == pd.Timestamp(EARNINGS_CASE["entry"], tz=ET.zone)].iloc[0]
+    assert twin["exit_reason"] == "EARNINGS_EXIT" and twin["exit_time"] == deadline
+
+
+def test_earnings_exit_on_a_half_day_uses_the_last_decision_bar(portfolio, tmp_path):
+    log, trades = _run_earnings_case(portfolio, tmp_path, half_day=True)
+    cutoff = pd.Timestamp(f"{EARNINGS_CASE['event']} 12:30", tz=ET.zone)
+    exit_row = log.query("event == @J.EXIT_FILL").iloc[-1]
+    assert exit_row["exit_reason"] == "EARNINGS_EXIT" and exit_row["ts_utc"] == cutoff + pd.Timedelta(seconds=25)
+    twin = trades[trades["entry_time"] == pd.Timestamp(EARNINGS_CASE["entry"], tz=ET.zone)].iloc[0]
+    assert twin["exit_reason"] == "EARNINGS_EXIT" and twin["exit_time"] == cutoff
 
 
 def test_bot_fails_closed_without_upcoming_earnings_date(live_setup, signals):
@@ -1298,9 +1321,16 @@ def test_stale_exit_state_never_sells_a_later_position(live_setup, signals):
     del broker.positions["SYN"]
     _step(bot, broker, when + pd.Timedelta(seconds=30))
     assert bot.exit_pending == {} and "SYN" not in bot.trades
-    bot.exit_pending["SYN"] = {"reason": "X", "ref": None, "attempts": 1, "order_id": None, "last_try": when}
-    blocked = bot.risk.entry_block_reason("SYN", when.date(), set(), set(bot.exit_pending), set(), "cid")
-    assert blocked == "OPEN_ORDER_EXISTS"
+    submitted = len(broker.submitted)
+    bot.exit_pending["SYN"] = {"reason": "X", "ref": None, "attempts": 1, "order_id": "gone",
+                               "last_try": when}
+    broker.orders["gone"] = SimpleNamespace(id="gone", status="accepted", symbol="SYN", side="sell")
+    later = next(i for i in np.flatnonzero(signals["entry"].to_numpy())
+                 if i > t + 7 and in_trading_window(signals.index[i]))
+    bot.last_processed_end = None
+    _step(bot, broker, signals.index[later] + pd.Timedelta(seconds=25))
+    row = read_journal(journal.path).query("event == @J.BAR_CHECK").iloc[-1]
+    assert row["action"] == "BLOCKED_OPEN_ORDER_EXISTS" and len(broker.submitted) == submitted
 
 
 def test_restart_keeps_the_ratcheted_stop_when_the_broker_lost_it(live_setup, signals):
@@ -1657,16 +1687,18 @@ def test_backtest_cli_compare_and_ledger_warning(tmp_path, portfolio, capsys):
 
 
 def test_compare_isolates_the_blackout_and_reports_added_signals(portfolio):
-    data = {s: portfolio[s][OHLC] for s in ("SYN7", "SYN1", "SYN3")}
-    first_day = data["SYN1"].index[450].date()
-    cal = {"SYN1": [(first_day, "AMC")]}
+    data = {s: portfolio[s][OHLC] for s in ("SYN7", "SYN4", "SYN3")}
+    cal = {"SYN4": [(dt.date(2023, 4, 21), "AMC")]}       # v1 holds SYN4 from 04-19 to 04-24
+    v1 = Backtester(strategy_cfg=V1, calendar=cal).run({"SYN4": data["SYN4"]}).trades
+    assert (v1["exit_reason"] == "EARNINGS_EXIT").any(), "the event must cut a v1 trade for this test to bite"
     tables = backtest.compare_variants(data, None, BacktestConfig(), ExecutionConfig(), cal)
-    names = list(tables["portfolio"]["variant"])
-    assert "v1 + earnings blackout" in names and "v2 without earnings blackout" in names
     plain = backtest.compare_variants(data, None, BacktestConfig(), ExecutionConfig(), None)
-    v1_cal = tables["portfolio"].set_index("variant").loc["v1 (original spec)"]
-    v1_plain = plain["portfolio"].set_index("variant").loc["v1 (original spec)"]
-    assert v1_cal["trades"] == v1_plain["trades"]                 # the v1 baseline ignores the calendar
+    rows, plain_rows = tables["portfolio"].set_index("variant"), plain["portfolio"].set_index("variant")
+    assert "v1 + earnings blackout" in rows.index and "v2 without earnings blackout" in rows.index
+    for col in ("trades", "expectancy_r"):                        # the v1 baseline ignores the calendar
+        assert rows.loc["v1 (original spec)", col] == pytest.approx(plain_rows.loc["v1 (original spec)", col])
+    assert rows.loc["v1 + earnings blackout", "expectancy_r"] != pytest.approx(
+        rows.loc["v1 (original spec)", "expectancy_r"])
     rules = tables["filters"].set_index("filter")
     assert rules.loc["+DI>-DI signal bar", "pure_filter"]
     anchor = rules.loc["ADX/DI at anchor"]

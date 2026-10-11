@@ -278,7 +278,8 @@ def check_performance(df: pd.DataFrame, min_trades: int, backtest_expectancy: Op
     return out
 
 
-def evaluate(df: pd.DataFrame, symbols: list[str], risk_cfg: RiskConfig = RiskConfig(), slippage_bps: float = 5.0,
+def evaluate(df: pd.DataFrame, symbols: list[str], risk_cfg: RiskConfig = RiskConfig(),
+             slippage_bps: float = config.SLIPPAGE_PER_SIDE * 1e4,
              min_trades: int = 30, backtest_expectancy: Optional[float] = None, replay: bool = False,
              strategy_cfg: StrategyConfig = StrategyConfig()) -> tuple[list[Check], str]:
     checks = (check_coverage(df, symbols) + check_latency(df) + check_errors(df) + check_idempotency(df)
@@ -330,7 +331,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--journal", default=config.JOURNAL_PATH)
     parser.add_argument("--min-trades", type=int, default=30)
-    parser.add_argument("--slippage-bps", type=float, default=5.0, help="per-side slippage assumed by the backtest")
+    parser.add_argument("--slippage-bps", type=float, default=config.SLIPPAGE_PER_SIDE * 1e4,
+                        help="per-side slippage assumed by the backtest (default: config.SLIPPAGE_PER_SIDE)")
     parser.add_argument("--backtest-expectancy", type=float, help="expectancy (R) from backtest.py, for comparison")
     parser.add_argument("--replay", action="store_true", help="re-fetch bars and verify every live decision")
     args = parser.parse_args(argv)

@@ -67,8 +67,11 @@ improvement on that window proves nothing. The honest sequence:
 3. Run the same `--compare` once on a period nobody has looked at, e.g. `--start 2019-01-01 --end
    2023-12-31` (it contains the 2020 crash, the 2022 bear market and 2023). Accept a variant only
    if it is positive there, holds up at `--slippage-bps 5` as well as 2, does not depend on one
-   symbol (the `w/o best` column), and a filter beats a random drop of the same size (`vs random
-   drop` above ~95%). The backtest keeps a ledger and warns when a window has been used before.
+   symbol (the `w/o best` column), and a pure filter beats randomly dropping whole weeks of signals
+   (`vs random drop` above ~95%). The anchor check also *adds* signals, so it shows `n/a` there: judge
+   it by its `rule R` and by its held-out folds. The backtest appends every run to
+   `backtest_ledger.csv` and warns when a window has been used before; commit that file so the
+   record follows you to other machines.
 4. If nothing passes, stop iterating on these 5 symbols and 2 years: every further look spends the
    held-out data. Paper trading is still useful for checking operations and measuring real costs.
 
@@ -103,8 +106,11 @@ alpaca-py has no earnings calendar, so `earnings_calendar.csv` is maintained by 
 `earnings_calendar.example.csv`): `symbol,date,timing` with timing `AMC`, `BMO` or blank. Get dates
 from each company's investor-relations page or the SEC 8-K filing time. For a report on day D the
 bot stops opening new positions from the session before the last hold day, and closes open ones at
-the 14:30 decision on the last hold day (D for after-close reports, the session before D otherwise),
-retrying every 30 s. Backtests need past dates too (~4 per year per stock) or they print a warning.
+14:30 on the last hold day (D for after-close reports, the session before D otherwise), or at that
+session's last decision bar if it closes early. The live check runs every 30 s heartbeat from the
+calendar alone, so a market-data outage cannot delay it; a failed exit is re-protected and retried
+with a 30 s to 10 min backoff. Backtests need past dates too (~4 per year per stock) or they print a
+warning.
 
 ## Other design notes
 

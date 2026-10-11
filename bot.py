@@ -673,12 +673,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
     exec_cfg = ExecutionConfig()
     calendar = load_earnings_calendar(config.EARNINGS_CALENDAR_PATH)
-    single_names = [s for s in config.SYMBOLS if s not in ("SPY", "QQQ")]
-    if not calendar:
-        log.warning("No earnings calendar at %s: %s can be held through earnings gaps. See src/events.py.",
-                    config.EARNINGS_CALENDAR_PATH, ", ".join(single_names))
-    elif missing := [s for s in single_names if s not in calendar]:
-        log.warning("Earnings calendar has no dates for %s", ", ".join(missing))
+    single_names = [s for s in config.SYMBOLS if s not in config.ETF_SYMBOLS]
+    missing = [s for s in single_names if s not in calendar]
+    if missing:
+        consequence = ("no new entries in them (fail closed)" if RiskConfig().earnings_fail_closed
+                       else "they can be held through earnings gaps")
+        log.warning("Earnings calendar %s has no dates for %s: %s. See earnings_calendar.example.csv.",
+                    config.EARNINGS_CALENDAR_PATH, ", ".join(missing), consequence)
     client = AlpacaClient(key, secret, paper, exec_cfg)
     account = client.get_account()
     if account.trading_blocked or account.account_blocked:

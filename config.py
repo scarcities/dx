@@ -100,8 +100,9 @@ class StrategyConfig:
     anchor_rsi: float = 50.0
     anchor_max_age: int = 30
 
-    # Earnings (see src/events.py): open positions are closed at the first decision bar at or
-    # after this time on the last session before the gap.
+    # Earnings (see src/events.py): on the last session before the gap, open positions are closed
+    # at this time (checked every heartbeat from the calendar), or at the last decision bar if that
+    # session closes early. A failed exit is retried with a 30 s -> 10 min backoff.
     earnings_exit_time: str = "14:30"
 
     # Closed bars required before any signal. EMA-200 seeded at bar 0 still carries
