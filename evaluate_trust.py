@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 import config
+from backtest import bootstrap_ci, week_clusters
 from config import RiskConfig, StrategyConfig
 from src import journal as J
 from src.journal import read_journal
@@ -46,14 +47,6 @@ class Check:
     name: str
     status: str
     detail: str
-
-
-def bootstrap_ci(values: np.ndarray, n: int = 10_000, alpha: float = 0.05, seed: int = 0) -> tuple[float, float]:
-    if len(values) < 2:
-        return float("nan"), float("nan")
-    rng = np.random.default_rng(seed)
-    means = rng.choice(values, size=(n, len(values)), replace=True).mean(axis=1)
-    return float(np.quantile(means, alpha / 2)), float(np.quantile(means, 1 - alpha / 2))
 
 
 def _rows(df: pd.DataFrame, event: str) -> pd.DataFrame:
@@ -90,6 +83,19 @@ def check_latency(df: pd.DataFrame) -> list[Check]:
     status = PASS if p95 <= 120 else (WARN if p95 <= 300 else FAIL)
     return [Check("Operations", "Decision latency after bar close", status,
                   f"median {lag.median():.0f}s, p95 {p95:.0f}s, max {lag.max():.0f}s")]
+
+
+def check_protection(df: pd.DataFrame) -> list[Check]:
+    """Positions that lost their stop, and exits that did not complete on the first try."""
+    messages = df["message"].fillna("")
+    unprotected = int(messages.str.contains("UNPROTECTED").sum())
+    restored = int((df["event"] == J.PROTECTIVE_STOP).sum())
+    failed_exits = int(messages.str.contains("EXIT_FAILED").sum())
+    ratchet_fail = int(messages.str.contains("Stop ratchet").sum())
+    status = FAIL if unprotected else (WARN if restored or failed_exits or ratchet_fail else PASS)
+    return [Check("Integrity", "Positions always protected by a stop", status,
+                  f"{restored} stop(s) re-placed after going missing, {unprotected} protective stop(s) rejected, "
+                  f"{failed_exits} exit attempt(s) retried, {ratchet_fail} failed stop ratchet attempt(s)")]
 
 
 def check_errors(df: pd.DataFrame) -> list[Check]:
@@ -193,6 +199,8 @@ def check_replay(df: pd.DataFrame, symbols: list[str], strategy_cfg: StrategyCon
 
     checks = _rows(df, J.BAR_CHECK).dropna(subset=["decision_bar_et"])
     checks = checks[checks["in_position"].astype(str) != "True"]
+    # Calendar-driven decisions do not come from bars, so a bar replay cannot reproduce them.
+    checks = checks[~checks["reason_code"].isin(["EARNINGS_BLACKOUT", "EARNINGS_CALENDAR_STALE"])]
     if checks.empty:
         return [Check("Parity", "Live vs replay signals", INCONCLUSIVE, "no flat bar checks to compare")]
     try:
@@ -234,16 +242,16 @@ def check_replay(df: pd.DataFrame, symbols: list[str], strategy_cfg: StrategyCon
 
 
 def check_performance(df: pd.DataFrame, min_trades: int, backtest_expectancy: Optional[float]) -> list[Check]:
-    exits = _rows(df, J.EXIT_FILL)
-    r = exits["r_multiple"].dropna().to_numpy(dtype=float)
+    exits = _rows(df, J.EXIT_FILL).dropna(subset=["r_multiple"])
+    r = exits["r_multiple"].to_numpy(dtype=float)
     pnl = exits["pnl"].dropna()
     if len(r) == 0:
         return [Check("Edge", "Expectancy", INCONCLUSIVE, "no closed trades yet")]
-    lo, hi = bootstrap_ci(r)
+    lo, hi = bootstrap_ci(r, clusters=week_clusters(exits["ts_utc"]))
     gross_loss = -pnl[pnl < 0].sum()
     pf = pnl[pnl > 0].sum() / gross_loss if gross_loss > 0 else float("inf")
     detail = (f"{len(r)} closed trades | win rate {(r > 0).mean():.0%} | expectancy {r.mean():+.3f}R "
-              f"(95% CI {lo:+.3f} .. {hi:+.3f}) | profit factor {pf:.2f} | P&L ${pnl.sum():,.2f}")
+              f"(95% CI {lo:+.3f} .. {hi:+.3f}, weeks resampled) | profit factor {pf:.2f} | P&L ${pnl.sum():,.2f}")
     if len(r) < min_trades:
         status = INCONCLUSIVE
         detail += f" | need >= {min_trades} trades before the CI means anything"
@@ -270,7 +278,8 @@ def evaluate(df: pd.DataFrame, symbols: list[str], risk_cfg: RiskConfig = RiskCo
              min_trades: int = 30, backtest_expectancy: Optional[float] = None, replay: bool = False,
              strategy_cfg: StrategyConfig = StrategyConfig()) -> tuple[list[Check], str]:
     checks = (check_coverage(df, symbols) + check_latency(df) + check_errors(df) + check_idempotency(df)
-              + check_lifecycle(df) + check_execution(df, slippage_bps) + check_risk(df, risk_cfg))
+              + check_protection(df) + check_lifecycle(df) + check_execution(df, slippage_bps)
+              + check_risk(df, risk_cfg))
     if replay:
         checks += check_replay(df, symbols, strategy_cfg)
     edge = check_performance(df, min_trades, backtest_expectancy)

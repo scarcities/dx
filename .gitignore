@@ -6,7 +6,10 @@
 # Runtime output (journals, logs, backtest exports)
 *.log
 *.csv
+*.csv.gz
+!earnings_calendar.example.csv
 logs/
+bars/
 
 # Python
 .venv/

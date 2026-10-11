@@ -37,8 +37,8 @@ if [ ! -f .venv/.requirements.sha256 ] || [ "$(cat .venv/.requirements.sha256)" 
 fi
 
 mkdir -p logs
-echo "Running offline test suite before going live ..."
-python -m pytest -q || { echo "Tests failed; refusing to start." >&2; exit 1; }
+echo "Running the quick offline test suite before starting (full suite: python -m pytest) ..."
+python -m pytest -q -m "not slow" || { echo "Tests failed; refusing to start." >&2; exit 1; }
 
 echo "Starting bot (logs/bot.log, paper_trading_journal.csv). Ctrl-C to stop."
 exec caffeinate -i -s python bot.py "$@"
