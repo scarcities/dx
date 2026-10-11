@@ -479,6 +479,18 @@ def test_event_window_uses_exchange_sessions():
     assert (unknown.block_from, unknown.last_hold, unknown.gap) == (d(2026, 7, 1), d(2026, 7, 2), d(2026, 7, 7))
     fallback = event_window(d(2026, 8, 3), "BMO")                         # no session list: extra margin
     assert fallback.last_hold == d(2026, 7, 30)
+    weekend = event_window(d(2026, 7, 4), "AMC", JULY_2026)               # Saturday report -> Monday BMO
+    assert (weekend.event, weekend.timing, weekend.last_hold) == (d(2026, 7, 6), "BMO", d(2026, 7, 2))
+
+
+def test_forced_exit_on_an_early_close_uses_the_last_decision_bar():
+    cal = {"AAPL": [(dt.date(2026, 11, 30), "BMO")]}                     # L = Fri 27 Nov, closes 13:00
+    sessions = [d.date() for d in pd.bdate_range("2026-11-16", "2026-12-11") if d.date() != dt.date(2026, 11, 26)]
+    half = {dt.date(2026, 11, 27): "12:30"}
+    at = lambda s: pd.Timestamp(s, tz=ET.zone)  # noqa: E731
+    assert forced_exit("AAPL", at("2026-11-27 12:30"), cal, sessions) is None          # 14:30 never comes
+    assert forced_exit("AAPL", at("2026-11-27 12:30"), cal, sessions, last_decision=half) == dt.date(2026, 11, 30)
+    assert forced_exit("AAPL", at("2026-11-27 11:30"), cal, sessions, last_decision=half) is None
 
 
 def test_entry_blackout_and_forced_exit_times():
@@ -679,6 +691,16 @@ def test_backtester_cost_model(backtest_results):
         assert (trades["slippage_cost"] > 0).all()
 
 
+def test_breakeven_cost_accounts_for_stop_width_and_exit_type():
+    from backtest import breakeven_cost_bps
+
+    stops = pd.DataFrame({"gross_r": [0.2, 0.2], "stop_pct": [0.006, 0.025], "exit_reason": ["STOP_LOSS"] * 2})
+    expected = 0.2 / np.mean([2 / 0.006, 2 / 0.025]) * 1e4
+    assert breakeven_cost_bps(stops) == pytest.approx(expected)
+    targets = stops.assign(exit_reason="TAKE_PROFIT", stop_pct=0.01)          # limit exits pay one side
+    assert breakeven_cost_bps(targets) == pytest.approx(0.2 * 0.01 * 1e4)
+
+
 def test_take_profit_needs_a_trade_through(portfolio):
     df = portfolio["SYN7"][OHLC]
     touch = Backtester(strategy_cfg=V1, bt_cfg=BacktestConfig(tp_requires_trade_through=False)).run({"S": df})
@@ -761,6 +783,8 @@ class FakeBroker:
         self.flattened = 0
         self.replaced, self.fail_replace = [], False
         self.protective, self.fail_protect, self.fail_close = [], False, 0
+        self.fail_fetch = False
+        self.fail_flatten, self.slow_close, self.hide_fills = False, False, False
         self._n = 0
 
     def _order(self, **kw):
@@ -815,6 +839,8 @@ class FakeBroker:
         return [o for o in self.orders.values() if o.status in ("new", "held") and (not symbols or o.symbol in symbols)]
 
     def fetch_session_bars(self, symbols, start, end, now=None):
+        if self.fail_fetch:
+            raise ConnectionError("market data unavailable (simulated)")
         return {s: complete_bars(self.bars[s], now) for s in symbols}
 
     def submit_bracket_order(self, symbol, qty, stop_price, take_profit, client_order_id):
@@ -837,9 +863,14 @@ class FakeBroker:
     def get_order(self, order_id):
         return self.orders[order_id]
 
-    def get_sessions(self, start, end):
-        days = sorted({d for df in self.bars.values() for d in df.index.date})
-        return [d for d in days if start <= d <= end]
+    def get_session_closes(self, start, end):
+        closes = {}
+        for df in self.bars.values():
+            for ts in df.index:
+                if start <= ts.date() <= end:
+                    end_time = f"{ts + pd.Timedelta(minutes=30):%H:%M}"     # last bar starts 30 min before close
+                    closes[ts.date()] = max(closes.get(ts.date(), ""), end_time)
+        return closes
 
     def restore_protection(self, symbol, qty, stop_price, take_profit):
         if self.fail_protect:
@@ -877,18 +908,25 @@ class FakeBroker:
         if self.fail_close:
             self.fail_close -= 1
             raise RuntimeError("insufficient qty available (simulated: cancel still pending)")
+        self.closed.append(symbol)
+        if self.slow_close:                                    # accepted, fills later
+            pos = self.positions[symbol]
+            return self._order(symbol=symbol, qty=float(pos.qty), side="sell", order_type="market", status="accepted")
         pos = self.positions.pop(symbol)
         order = self._order(symbol=symbol, qty=float(pos.qty), side="sell", order_type="market", status="new")
         self._fill(order, round(self._last_close(symbol) * 0.9997, 4))
-        self.closed.append(symbol)
         return order
 
     def flatten_all(self):
         self.flattened += 1
+        if self.fail_flatten:
+            raise RuntimeError("flatten failed (simulated)")
         for symbol in list(self.positions):
             self.close_position(symbol)
 
     def find_latest_fill(self, symbol, side, since):
+        if self.hide_fills:
+            return None
         fills = [o for o in self.orders.values() if o.symbol == symbol and o.side == side and o.status == "filled"
                  and o.filled_at >= since]
         return max(fills, key=lambda o: o.filled_at) if fills else None
@@ -1125,6 +1163,30 @@ def test_bot_earnings_blocks_entry_and_forces_exit(live_setup, signals, tmp_path
         assert exits.iloc[0]["ts_utc"] < deadline
 
 
+def test_bot_earnings_exit_does_not_need_market_data(live_setup, signals, tmp_path):
+    """Market data fails from the morning of the last hold day: the exit still happens at 14:30."""
+    bars, broker, journal, t = live_setup
+    sessions = sorted(set(bars.index.date))
+    day = signals.index[t].date()
+    event = sessions[sessions.index(day) + 2]
+    bot = _make_bot(broker, journal, calendar={"SYN": [(event, "AMC")]})
+    deadline = pd.Timestamp(f"{event} 14:30", tz=ET.zone)
+    for when in _decision_times(bars, t - 1, t + 40):
+        broker.fail_fetch = when.date() >= event
+        try:
+            _step(bot, broker, when)
+        except ConnectionError:
+            pass                                   # run_forever logs this and carries on
+        if broker.submitted and "SYN" not in broker.positions or when > deadline + pd.Timedelta(minutes=5):
+            break
+    exits = read_journal(journal.path).query("event == @J.EXIT_FILL")
+    assert len(exits) == 1
+    if exits.iloc[0]["exit_reason"] == "EARNINGS_EXIT":
+        assert exits.iloc[0]["ts_utc"] == deadline + pd.Timedelta(seconds=25)
+    else:
+        assert exits.iloc[0]["ts_utc"] < deadline
+
+
 def test_bot_fails_closed_without_upcoming_earnings_date(live_setup, signals):
     bars, broker, journal, t = live_setup
     bot = _make_bot(broker, journal, risk=RiskConfig())                              # fail closed (default)
@@ -1179,6 +1241,94 @@ def test_protection_is_never_placed_on_a_position_that_is_gone(live_setup, signa
     broker.close_position("SYN")                             # sold behind the bot's back
     bot._ensure_protection("SYN", when + pd.Timedelta(seconds=40), immediate=True)
     assert broker.protective == []
+
+
+def test_bot_kill_switch_retries_a_failed_flatten_and_survives_restart(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal)
+    when = signals.index[t] + pd.Timedelta(seconds=25)
+    _step(bot, broker, when)
+    broker.equity, broker.fail_flatten = 96_900.0, True
+    _step(bot, broker, when + pd.Timedelta(seconds=30))       # trip; flatten raises
+    assert "SYN" in broker.positions and bot.exit_pending["SYN"]["reason"] == "KILL_SWITCH"
+    _step(bot, broker, when + pd.Timedelta(seconds=60))       # heartbeat retry closes it
+    assert "SYN" not in broker.positions and broker.protective == []
+    assert read_journal(journal.path).query("event == @J.EXIT_FILL").iloc[-1]["exit_reason"] == "KILL_SWITCH"
+    restarted = _make_bot(broker, journal)                    # restart the same day
+    restarted.bootstrap()
+    assert restarted.risk.is_halted(when.tz_convert(ET.zone).date())
+
+
+def test_bot_closes_an_adopted_position_with_no_known_stop(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal)
+    when = signals.index[t] + pd.Timedelta(seconds=25)
+    broker.now = when
+    broker.positions["SYN"] = SimpleNamespace(symbol="SYN", qty="10", avg_entry_price="100", checked_until=when)
+    for k in (0, 1, 3, 4):
+        _step(bot, broker, when + pd.Timedelta(seconds=30 * k))
+    log = read_journal(journal.path)
+    assert log["message"].fillna("").str.contains("no known stop level").any()
+    assert "SYN" not in broker.positions
+    assert log.query("event == @J.EXIT_FILL").iloc[-1]["exit_reason"] == "UNPROTECTED_EXIT"
+
+
+def test_stale_exit_state_never_sells_a_later_position(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal)
+    when = signals.index[t] + pd.Timedelta(seconds=25)
+    _step(bot, broker, when)
+    bot.exit_pending["SYN"] = {"reason": "EARNINGS_EXIT", "ref": None, "attempts": 1, "order_id": None,
+                               "last_try": when}
+    broker.hide_fills = True                                  # position gone, fill not found
+    for order in broker.get_open_orders(["SYN"]):
+        order.status = "canceled"
+    del broker.positions["SYN"]
+    _step(bot, broker, when + pd.Timedelta(seconds=30))
+    assert bot.exit_pending == {} and "SYN" not in bot.trades
+    bot.exit_pending["SYN"] = {"reason": "X", "ref": None, "attempts": 1, "order_id": None, "last_try": when}
+    blocked = bot.risk.entry_block_reason("SYN", when.date(), set(), set(bot.exit_pending), set(), "cid")
+    assert blocked == "OPEN_ORDER_EXISTS"
+
+
+def test_restart_keeps_the_ratcheted_stop_when_the_broker_lost_it(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal, cfg=TRAIL)
+    when = signals.index[t] + pd.Timedelta(seconds=25)
+    _step(bot, broker, when)
+    raised = bot.trades["SYN"].stop_price + 1.0
+    journal.log(J.STOP_RATCHET, now=when + pd.Timedelta(seconds=5), symbol="SYN", stop_price=raised)
+    for order in broker.get_open_orders(["SYN"]):
+        order.status = "canceled"
+    restarted = _make_bot(broker, journal, cfg=TRAIL)
+    restarted.bootstrap()
+    assert restarted.trades["SYN"].stop_price == pytest.approx(raised) and restarted.trades["SYN"].trailed
+
+
+def test_a_slow_exit_fill_is_not_resubmitted_or_mislabelled(live_setup, signals):
+    bars, broker, journal, t = live_setup
+    bot = _make_bot(broker, journal, cfg=replace(CFG, max_hold_bars=1))
+    when = signals.index[t] + pd.Timedelta(seconds=25)
+    _step(bot, broker, when)
+    broker.slow_close = True
+    exit_at = next(w for w in _decision_times(bars, t, t + 20) if w > when)
+    _step(bot, broker, exit_at)                               # market sell accepted, not filled yet
+    order = next(o for o in broker.orders.values() if o.side == "sell" and o.order_type == "market")
+    broker.now = exit_at + pd.Timedelta(seconds=10)
+    broker._fill(order, 101.0)                                # fills between heartbeats
+    original = broker.get_positions
+
+    def positions_then_gone():
+        result = original()
+        broker.positions.pop("SYN", None)                     # gone right after this snapshot
+        return result
+
+    broker.get_positions = positions_then_gone
+    _step(bot, broker, exit_at + pd.Timedelta(seconds=30))
+    broker.get_positions = original
+    _step(bot, broker, exit_at + pd.Timedelta(seconds=60))
+    assert broker.closed.count("SYN") == 1
+    assert read_journal(journal.path).query("event == @J.EXIT_FILL").iloc[-1]["exit_reason"] == "TIME_EXIT"
 
 
 def test_bot_restores_a_missing_stop_after_the_grace_period(live_setup, signals):
@@ -1410,16 +1560,42 @@ def test_restore_protection_places_oco_then_falls_back_to_a_plain_stop():
         stuck.restore_protection("AAPL", 10, 195.12, 210.0)
 
 
+def test_restore_protection_counts_a_lost_response_as_success():
+    from src.alpaca_client import AlpacaClient
+
+    open_orders = []
+
+    class Trading:
+        def get_orders(self, filter=None):
+            return list(open_orders)
+
+        def cancel_order_by_id(self, order_id):
+            pass
+
+        def submit_order(self, request):                    # accepted, but the response is lost
+            open_orders.append(SimpleNamespace(id="oco", symbol="AAPL", side="sell", status="held",
+                                               order_type="stop", type="stop", stop_price=195.12, limit_price=None))
+            raise ConnectionError("reset by peer")
+
+    client = AlpacaClient("k", "s", True, ExecutionConfig(cancel_poll_timeout_seconds=0.0), trading=Trading(),
+                          data=object(), sleep=lambda s: None)
+    assert client.restore_protection("AAPL", 10, 195.12, 210.0) == "oco"
+    assert len(open_orders) == 1                             # no blind retry, no duplicate
+
+
 def test_get_sessions_reads_the_exchange_calendar():
     from src.alpaca_client import AlpacaClient
 
     class Trading:
         def get_calendar(self, request):
             assert request.start == dt.date(2026, 7, 1)
-            return [SimpleNamespace(date=dt.date(2026, 7, 2)), SimpleNamespace(date=dt.date(2026, 7, 6))]
+            return [SimpleNamespace(date=dt.date(2026, 7, 2), close=dt.datetime(2026, 7, 2, 13, 0)),
+                    SimpleNamespace(date=dt.date(2026, 7, 6), close=dt.datetime(2026, 7, 6, 16, 0))]
 
     client = AlpacaClient("k", "s", True, ExecutionConfig(), trading=Trading(), data=object())
     assert client.get_sessions(dt.date(2026, 7, 1), dt.date(2026, 7, 7)) == [dt.date(2026, 7, 2), dt.date(2026, 7, 6)]
+    assert client.get_session_closes(dt.date(2026, 7, 1), dt.date(2026, 7, 7)) == {
+        dt.date(2026, 7, 2): "13:00", dt.date(2026, 7, 6): "16:00"}
 
 
 # ============================================================================ backtest CLI
@@ -1461,11 +1637,47 @@ def test_backtest_cli_compare_and_ledger_warning(tmp_path, portfolio, capsys):
     assert backtest.main(args) == 0
     first = capsys.readouterr().out
     for section in ("VARIANT COMPARISON", "v1 (original spec)", "v2 (defaults)", "Paired exit study",
-                    "ema_cross (v1)", "Entry filters", "vs random drop"):
+                    "ema_cross (v1)", "Entry rules", "vs random drop", "added"):
         assert section in first
     assert "already evaluated" not in first
     assert backtest.main(args) == 0
     assert "already evaluated in 1 earlier run" in capsys.readouterr().out
+
+
+def test_compare_isolates_the_blackout_and_reports_added_signals(portfolio):
+    data = {s: portfolio[s][OHLC] for s in ("SYN7", "SYN1", "SYN3")}
+    first_day = data["SYN1"].index[450].date()
+    cal = {"SYN1": [(first_day, "AMC")]}
+    tables = backtest.compare_variants(data, None, BacktestConfig(), ExecutionConfig(), cal)
+    names = list(tables["portfolio"]["variant"])
+    assert "v1 + earnings blackout" in names and "v2 without earnings blackout" in names
+    plain = backtest.compare_variants(data, None, BacktestConfig(), ExecutionConfig(), None)
+    v1_cal = tables["portfolio"].set_index("variant").loc["v1 (original spec)"]
+    v1_plain = plain["portfolio"].set_index("variant").loc["v1 (original spec)"]
+    assert v1_cal["trades"] == v1_plain["trades"]                 # the v1 baseline ignores the calendar
+    rules = tables["filters"].set_index("filter")
+    assert rules.loc["+DI>-DI signal bar", "pure_filter"]
+    anchor = rules.loc["ADX/DI at anchor"]
+    assert anchor["kept"] + anchor["removed"] == rules.loc["cost floor 0.10R", "kept"] + \
+        rules.loc["cost floor 0.10R", "removed"]
+    if anchor["added"] > 0:
+        assert not anchor["pure_filter"] and anchor["random_drop_pct"] != anchor["random_drop_pct"]
+
+
+def test_slippage_flag_moves_the_strategy_cost_too(tmp_path, portfolio, monkeypatch):
+    seen = []
+
+    class Spy(backtest.Backtester):
+        def __init__(self, strategy_cfg=StrategyConfig(), *a, **kw):
+            seen.append((strategy_cfg.round_trip_cost, a[1].slippage_pct if len(a) > 1 else None))
+            super().__init__(strategy_cfg, *a, **kw)
+
+    monkeypatch.setattr(backtest, "Backtester", Spy)
+    path = str(tmp_path / "bars.csv.gz")
+    save_bars({"SYN1": with_session_columns(portfolio["SYN1"])}, path)
+    assert backtest.main(["--from-bars", path, "--symbols", "SYN1", "--slippage-bps", "2",
+                          "--ledger", str(tmp_path / "l.csv"), "--earnings", str(tmp_path / "x")]) == 0
+    assert seen[-1] == (pytest.approx(0.0004), pytest.approx(0.0002))
 
 
 @pytest.mark.slow

@@ -123,12 +123,25 @@ class TradeJournal:
         if df.empty:
             return {}
         open_trades: dict[str, dict] = {}
-        for _, row in df[df["event"].isin([ENTRY_FILL, EXIT_FILL])].iterrows():
+        for _, row in df[df["event"].isin([ENTRY_FILL, EXIT_FILL, STOP_RATCHET, PROTECTIVE_STOP])].iterrows():
+            symbol = row["symbol"]
             if row["event"] == ENTRY_FILL:
-                open_trades[row["symbol"]] = row.to_dict()
-            else:
-                open_trades.pop(row["symbol"], None)
+                open_trades[symbol] = row.to_dict()
+                open_trades[symbol]["last_journaled_stop"] = row["stop_price"]
+            elif row["event"] == EXIT_FILL:
+                open_trades.pop(symbol, None)
+            elif symbol in open_trades and pd.notna(row["stop_price"]):
+                prev = open_trades[symbol]["last_journaled_stop"]
+                open_trades[symbol]["last_journaled_stop"] = max(row["stop_price"], prev) if pd.notna(prev) \
+                    else row["stop_price"]
         return open_trades
+
+    def kill_switch_tripped_on(self, day) -> bool:
+        df = self.read()
+        if df.empty:
+            return False
+        trips = df[df["event"] == KILL_SWITCH]
+        return bool((trips["ts_utc"].dt.tz_convert(ET).dt.date == day).any())
 
 
 def read_journal(path: str) -> pd.DataFrame:

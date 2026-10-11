@@ -106,6 +106,10 @@ class RiskManager:
     def is_halted(self, day: dt.date) -> bool:
         return self._halted_day == day
 
+    def latch_halt(self, day: dt.date) -> None:
+        """Restore a kill-switch trip recorded earlier today (e.g. after a restart)."""
+        self._halted_day = day
+
     # ------------------------------------------------------------------ idempotency
     def entry_block_reason(
         self,

@@ -126,10 +126,13 @@ class AlpacaClient:
         return bool(clock.is_open) and in_trading_window(now, self.cfg.trade_window_start,
                                                          self.cfg.trade_window_end)
 
-    def get_sessions(self, start: dt.date, end: dt.date) -> list:
-        """Exchange trading days (holidays excluded) from Alpaca's calendar."""
+    def get_session_closes(self, start: dt.date, end: dt.date) -> dict:
+        """Exchange trading days (holidays excluded) -> close time "HH:MM" ET (13:00 on half days)."""
         request = GetCalendarRequest(start=start, end=end)
-        return [c.date for c in self._call("get_calendar", self.trading.get_calendar, request)]
+        return {c.date: f"{c.close:%H:%M}" for c in self._call("get_calendar", self.trading.get_calendar, request)}
+
+    def get_sessions(self, start: dt.date, end: dt.date) -> list:
+        return sorted(self.get_session_closes(start, end))
 
     def get_positions(self) -> dict:
         return {p.symbol: p for p in self._call("get_all_positions", self.trading.get_all_positions)}
@@ -246,19 +249,27 @@ class AlpacaClient:
         if self.get_open_orders([symbol]):
             raise ExitBlocked(f"{symbol}: orders still open after cancel; cannot re-protect yet")
         stop = StopLossRequest(stop_price=round_price(stop_price))
+        # Single attempts, verified against the broker: a retried POST whose first copy went
+        # through would be rejected for held shares and look like a failure.
         if take_profit is not None:
             target = round_price(take_profit)
             oco = LimitOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
                                     order_class=OrderClass.OCO, limit_price=target,
                                     take_profit=TakeProfitRequest(limit_price=target), stop_loss=stop)
             try:
-                self._call(f"protect_oco({symbol})", self.trading.submit_order, oco)
+                self.trading.submit_order(oco)
                 return "oco"
-            except APIError as exc:
-                log.warning("OCO re-protection for %s rejected (%s); placing a plain stop", symbol, exc)
+            except Exception as exc:  # noqa: BLE001
+                if self.bracket_levels(symbol)[0] is not None:
+                    return "oco"
+                log.warning("OCO re-protection for %s failed (%s); placing a plain stop", symbol, exc)
         plain = StopOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
                                  stop_price=stop.stop_price)
-        self._call(f"protect_stop({symbol})", self.trading.submit_order, plain)
+        try:
+            self.trading.submit_order(plain)
+        except Exception:  # noqa: BLE001
+            if self.bracket_levels(symbol)[0] is None:
+                raise
         return "stop"
 
     def bracket_levels(self, symbol: str) -> tuple[Optional[float], Optional[float]]:
@@ -276,8 +287,10 @@ class AlpacaClient:
 
     def find_latest_fill(self, symbol: str, side: str, since: dt.datetime):
         """Most recent filled order (legs included) for a symbol and side since a time."""
+        # `after` filters on submission time, and bracket legs are submitted with their parent at
+        # entry, so look back well before `since` and filter fills by filled_at below.
         request = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol], nested=True,
-                                   after=since - dt.timedelta(minutes=5), limit=200)
+                                   after=since - dt.timedelta(days=30), limit=500)
         candidates = []
         for order in self._call("get_orders(closed)", self.trading.get_orders, filter=request):
             for item in [order, *(order.legs or [])]:

@@ -162,6 +162,7 @@ class Backtester:
         self.scfg, self.rcfg, self.bcfg, self.ecfg = strategy_cfg, risk_cfg, bt_cfg, exec_cfg
         self.calendar = calendar or {}
         self.sessions: list = []
+        self.last_decision: dict = {}  # session date -> last in-window bar start "HH:MM" (half days)
 
     def _entry_fill(self, price: float) -> float:
         return price * (1.0 + self.bcfg.slippage_pct)
@@ -172,6 +173,14 @@ class Backtester:
 
     def _prepare(self, data: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         self.sessions = sorted(set().union(*[set(df.index.tz_convert(ET).date) for df in data.values()]))
+        self.last_decision = {}
+        for df in data.values():
+            local = df.index.tz_convert(ET)
+            in_window = [t for t in local if self._window_ok(t)]
+            for t in in_window:
+                stamp = f"{t:%H:%M}"
+                if stamp > self.last_decision.get(t.date(), ""):
+                    self.last_decision[t.date()] = stamp
         frames = {}
         for symbol, df in data.items():
             df = df.sort_index()
@@ -186,7 +195,8 @@ class Backtester:
         return entry_blackout(symbol, ts, self.calendar, self.sessions) is not None
 
     def _must_exit(self, symbol: str, ts) -> bool:
-        return forced_exit(symbol, ts, self.calendar, self.sessions, self.scfg.earnings_exit_time) is not None
+        return forced_exit(symbol, ts, self.calendar, self.sessions, self.scfg.earnings_exit_time,
+                           self.last_decision) is not None
 
     def _new_position(self, symbol: str, ts, row, size) -> Position:
         features = {f"sig_{k}": float(getattr(row, f"sig_{k}")) for k in SIGNAL_FEATURES}
@@ -519,6 +529,34 @@ FILTER_VARIANTS = {
 }
 
 
+def breakeven_cost_bps(trades: pd.DataFrame) -> float:
+    """Per-side cost c (bp) at which mean net R reaches zero. In R units a trade pays
+    k * c / stop_pct, with k = 1 when it exits on a take-profit limit (no exit slippage) and 2
+    otherwise, so c = mean(gross_r) / mean(k / stop_pct)."""
+    sides = np.where(trades["exit_reason"].str.startswith("TAKE_PROFIT"), 1.0, 2.0)
+    load = np.mean(sides / trades["stop_pct"].to_numpy(dtype=float))
+    return float(trades["gross_r"].mean() / load * 1e4) if load > 0 else float("nan")
+
+
+def cluster_random_drop_percentile(r: np.ndarray, clusters: np.ndarray, kept_mean: float, k: int,
+                                   draws: int = 5000, seed: int = 0) -> float:
+    """Share of random subsets that keep ~k signals by dropping whole ISO weeks (signals in the
+    same week are not independent) whose mean R is below `kept_mean`."""
+    rng = np.random.default_rng(seed)
+    labels = np.unique(clusters)
+    members = [np.flatnonzero(clusters == c) for c in labels]
+    means = np.empty(draws)
+    for d in range(draws):
+        chosen, count = [], 0
+        for i in rng.permutation(len(labels)):
+            if count >= k:
+                break
+            chosen.append(members[i])
+            count += len(members[i])
+        means[d] = r[np.concatenate(chosen)].mean()
+    return float((means < kept_mean).mean())
+
+
 def _variant_row(name: str, result: BacktestResult) -> dict:
     trades, m = result.trades, result.metrics
     lo, hi = bootstrap_ci(trades["r_multiple"], clusters=week_clusters(trades["entry_time"])) \
@@ -528,7 +566,7 @@ def _variant_row(name: str, result: BacktestResult) -> dict:
     best = by_symbol.idxmax() if len(by_symbol) else None
     without_best = trades.loc[trades["symbol"] != best, "r_multiple"].mean() if best is not None else float("nan")
     gross = trades["gross_r"].mean() if len(trades) else float("nan")
-    breakeven_bps = gross * trades["stop_pct"].mean() / 2 * 1e4 if len(trades) and gross > 0 else float("nan")
+    breakeven_bps = breakeven_cost_bps(trades) if len(trades) and gross > 0 else float("nan")
     return {"variant": name, "trades": m["n_trades"], "per_year": m["n_trades"] / years,
             "expectancy_r": m["expectancy_r"], "ci_lo": lo, "ci_hi": hi, "gross_r": gross,
             "breakeven_bps": breakeven_bps, "profit_factor": m["profit_factor"], "max_drawdown": m["max_drawdown"],
@@ -537,8 +575,9 @@ def _variant_row(name: str, result: BacktestResult) -> dict:
 
 
 def compare_variants(data: dict[str, pd.DataFrame], start, bt_cfg: BacktestConfig, exec_cfg: ExecutionConfig,
-                     calendar: Optional[EarningsCalendar] = None) -> dict[str, pd.DataFrame]:
-    base = StrategyConfig()
+                     calendar: Optional[EarningsCalendar] = None,
+                     base: Optional[StrategyConfig] = None) -> dict[str, pd.DataFrame]:
+    base = base or StrategyConfig()
     portfolio = []
     runs = []
     for name, overrides in COMPARE_VARIANTS.items():
@@ -546,7 +585,10 @@ def compare_variants(data: dict[str, pd.DataFrame], start, bt_cfg: BacktestConfi
         excluded = overrides.pop(EXCLUDE, ())
         if excluded and not set(excluded) & set(data):
             continue
-        runs.append((name, replace(base, **overrides), calendar, excluded))
+        # The v1 baseline is the original spec: no earnings blackout. Its effect gets its own row.
+        runs.append((name, replace(base, **overrides), None if name.startswith("v1 (") else calendar, excluded))
+        if name.startswith("v1 (") and calendar:
+            runs.append(("v1 + earnings blackout", replace(base, **overrides), calendar, ()))
     if calendar:
         runs.append(("v2 without earnings blackout", base, None, ()))
     for name, cfg, cal, excluded in runs:
@@ -573,30 +615,36 @@ def compare_variants(data: dict[str, pd.DataFrame], start, bt_cfg: BacktestConfi
                       "delta_hi": hi, "nights": out["nights"].mean(),
                       "mix": ", ".join(f"{k} {v:.0%}" for k, v in mix.head(4).items())})
 
-    # Filters: which v1 signals (under the v2 default exit) would each filter have removed?
-    reference = Backtester(replace(v1, exit_mode=base.exit_mode), RiskConfig(), bt_cfg, exec_cfg, calendar)
-    signals = reference.signal_outcomes(data, start)
-    r_all = signals["r_multiple"].to_numpy()
+    # Entry rules vs the v1 signals, all under the v2 default exit. A pure filter only removes
+    # signals; a replacement rule (e.g. the anchor check) can also add some, reported separately.
+    def outcomes_for(overrides: dict) -> pd.DataFrame:
+        cfg = replace(v1, exit_mode=base.exit_mode, **overrides)
+        return Backtester(cfg, RiskConfig(), bt_cfg, exec_cfg, calendar).signal_outcomes(data, start)
+
+    reference = outcomes_for({})
+    key = ["symbol", "entry_time"]
     filters = []
-    rng = np.random.default_rng(0)
     for name, overrides in FILTER_VARIANTS.items():
-        flags = []
-        frames = Backtester(replace(v1, **overrides), RiskConfig(), bt_cfg, exec_cfg)._prepare(data)
-        for _, sig in signals.iterrows():
-            row = frames[sig["symbol"]].loc[sig["entry_time"]]
-            flags.append(not bool(row.sig_entry))
-        removed = np.array(flags, dtype=bool)
-        kept_r, removed_r = r_all[~removed], r_all[removed]
+        variant = outcomes_for(overrides)
+        merged = reference.merge(variant[key].assign(_in=True), on=key, how="left")
+        kept_mask = merged["_in"].notna().to_numpy()
+        added = variant.merge(reference[key].assign(_in=True), on=key, how="left")
+        added = added[added["_in"].isna()]
+        r_all = reference["r_multiple"].to_numpy(dtype=float)
+        kept_r, removed_r = r_all[kept_mask], r_all[~kept_mask]
         k = len(kept_r)
-        if 0 < k < len(r_all):
-            random_means = np.array([rng.choice(r_all, size=k, replace=False).mean() for _ in range(5000)])
-            percentile = float((random_means < kept_r.mean()).mean())
+        pure = len(added) == 0
+        if pure and 0 < k < len(r_all):
+            percentile = cluster_random_drop_percentile(r_all, week_clusters(reference["entry_time"]),
+                                                        kept_r.mean(), k)
         else:
             percentile = float("nan")
         filters.append({"filter": name, "kept": k, "kept_r": kept_r.mean() if k else float("nan"),
-                        "removed": int(removed.sum()),
+                        "removed": int((~kept_mask).sum()),
                         "removed_r": removed_r.mean() if len(removed_r) else float("nan"),
-                        "random_drop_pct": percentile})
+                        "added": len(added), "added_r": added["r_multiple"].mean() if len(added) else float("nan"),
+                        "variant_r": variant["r_multiple"].mean() if len(variant) else float("nan"),
+                        "random_drop_pct": percentile, "pure_filter": pure})
     return {"portfolio": pd.DataFrame(portfolio), "exits": pd.DataFrame(exits), "filters": pd.DataFrame(filters)}
 
 
@@ -620,19 +668,26 @@ def format_comparison(tables: dict[str, pd.DataFrame], prior_runs: int = 0) -> s
         ci = f"[{_num(r['delta_lo'], '+.3f')},{_num(r['delta_hi'], '+.3f')}]" if r["delta_r"] == r["delta_r"] else "-"
         lines.append(f" {r['exit']:<29} {r['signals']:>7} {_num(r['expectancy_r'], '+.3f'):>7} "
                      f"{_num(r['delta_r'], '+.3f'):>8} {ci:>17} {_num(r['nights'], '.1f'):>6}  {r['mix']}")
-    lines += ["-" * width, " Entry filters: the v1 signals each filter removes (R under the v2 default exit)",
-              f" {'filter':<20} {'kept':>5} {'kept R':>8} {'removed':>8} {'removed R':>10} {'vs random drop':>15}"]
+    lines += ["-" * width, " Entry rules vs the v1 signals (R under the v2 default exit; 'added' = signals v1 did not have)",
+              f" {'rule':<20} {'kept':>5} {'kept R':>8} {'removed':>8} {'removed R':>10} {'added':>6} {'added R':>8} "
+              f"{'rule R':>7} {'vs random drop':>16}"]
     for _, r in tables["filters"].iterrows():
-        pct = f"{r['random_drop_pct']:.0%} pctile" if r["random_drop_pct"] == r["random_drop_pct"] else "-"
+        if r["random_drop_pct"] == r["random_drop_pct"]:
+            pct = f"{r['random_drop_pct']:.0%} pctile"
+        else:
+            pct = "n/a (not a pure filter)" if not r["pure_filter"] else "-"
         lines.append(f" {r['filter']:<20} {r['kept']:>5} {_num(r['kept_r'], '+.3f'):>8} {r['removed']:>8} "
-                     f"{_num(r['removed_r'], '+.3f'):>10} {pct:>15}")
+                     f"{_num(r['removed_r'], '+.3f'):>10} {r['added']:>6} {_num(r['added_r'], '+.3f'):>8} "
+                     f"{_num(r['variant_r'], '+.3f'):>7} {pct:>16}")
     lines += ["-" * width,
               " How to read this:",
               "  * Every v2 change was proposed after looking at this window, so gains here are in-sample. Confirm on",
               "    a period nobody has looked at (e.g. --start 2019-01-01 --end 2023-12-31) before relying on one.",
-              "  * A filter is only evidence if 'vs random drop' is above ~95% (randomly removing the same number of",
-              "    signals rarely does as well) and 'w/o best' stays >= 0 (it is not one stock's rally).",
+              "  * A filter is only evidence if 'vs random drop' is above ~95% (randomly dropping whole weeks of",
+              "    signals rarely does as well) and 'w/o best' stays >= 0 (it is not one stock's rally). Rules that",
+              "    also add signals (anchor) cannot be judged that way: compare 'rule R' with v1 and check folds.",
               "  * 'BE bp' is the per-side cost at which gross expectancy is used up. Blank = no gross edge at all.",
+              "  * The v1 row has no earnings blackout (the original spec); 'v1 + earnings blackout' isolates it.",
               "  * Fewer than ~30 trades per cell means the CI is wider than any plausible edge.",
               "=" * width]
     return "\n".join(lines)
@@ -744,8 +799,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     bt_cfg = BacktestConfig(years=args.years, initial_equity=args.equity)
-    if args.slippage_bps is not None:
+    strategy_cfg = StrategyConfig()
+    if args.slippage_bps is not None:  # one cost assumption: fills, cost floor and breakeven move together
         bt_cfg = replace(bt_cfg, slippage_pct=args.slippage_bps / 1e4)
+        strategy_cfg = replace(strategy_cfg, round_trip_cost=2 * args.slippage_bps / 1e4)
     exec_cfg = ExecutionConfig(data_feed=args.feed) if args.feed else ExecutionConfig()
     start, end = _day(args.start), _day(args.end, end_of_day=True)
     span = pd.Timedelta(days=int(365.25 * bt_cfg.years))
@@ -798,13 +855,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("!" * 78)
     window = (start, max(df.index.max() for df in data.values()))
     if args.compare:
-        tables = compare_variants(data, start, bt_cfg, exec_cfg, calendar)
+        tables = compare_variants(data, start, bt_cfg, exec_cfg, calendar, strategy_cfg)
         prior = append_ledger(args.ledger, window, list(data), [
             {"variant": r["variant"], "trades": r["trades"], "expectancy_r": r["expectancy_r"]}
             for _, r in tables["portfolio"].iterrows()])
         print(format_comparison(tables, prior))
         return 0
-    result = Backtester(StrategyConfig(), RiskConfig(), bt_cfg, exec_cfg, calendar).run(data, start=start)
+    result = Backtester(strategy_cfg, RiskConfig(), bt_cfg, exec_cfg, calendar).run(data, start=start)
     append_ledger(args.ledger, window, list(data), [{"variant": "v2 (defaults)", "trades": result.metrics["n_trades"],
                                                     "expectancy_r": result.metrics["expectancy_r"]}])
     print(format_tear_sheet(result))

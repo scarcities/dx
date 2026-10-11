@@ -103,7 +103,7 @@ class TradingBot:
         self.exit_pending: dict[str, dict] = {}       # exits that did not complete; retried every heartbeat
         self.desired_stop: dict[str, dict] = {}       # ratchets that did not complete; retried every heartbeat
         self.unprotected_since: dict[str, pd.Timestamp] = {}
-        self._sessions: tuple = (None, None)          # (ET date fetched, exchange session dates)
+        self._sessions: tuple = (None, None, None)    # (ET date fetched, session dates, last decision times)
         self.submitted_ids: set[str] = set()
         self.last_decision_bar: dict[str, pd.Timestamp] = {}
         self.last_processed_end: Optional[pd.Timestamp] = None
@@ -125,8 +125,9 @@ class TradingBot:
             if entry is not None:
                 ref, j_stop = _float(entry.get("ref_price")), _float(entry.get("stop_price"))
                 ref_bar = entry.get("ref_bar_et")
+                last_stop = _float(entry.get("last_journaled_stop")) or j_stop   # ratchets / re-protections
                 trade = OpenTrade(symbol, _float(entry.get("qty")) or 0.0, _float(entry.get("fill_price")) or 0.0,
-                                  pd.Timestamp(entry["ts_utc"]), stop if stop is not None else j_stop,
+                                  pd.Timestamp(entry["ts_utc"]), stop if stop is not None else last_stop,
                                   _float(entry.get("take_profit")), ref_bar if pd.notna(ref_bar) else None,
                                   ref - j_stop if ref is not None and j_stop is not None else None,
                                   str(entry.get("client_order_id") or ""), j_stop, ref)
@@ -137,6 +138,10 @@ class TradingBot:
             self.trades[symbol] = trade
             if pos is not None and stop is None:
                 self.journal.log(J.ERROR, now=now, symbol=symbol, message="Open position has no working stop order")
+        if self.journal.kill_switch_tripped_on(to_et(now).date()):
+            self.risk.latch_halt(to_et(now).date())          # a restart must not re-open trading today
+            self.kill_switch_flattening = True
+            log.warning("Kill-switch already tripped today (journal): no new entries until tomorrow")
         for symbol in self.symbols:
             if symbol not in config.ETF_SYMBOLS and not has_upcoming_event(symbol, now, self.calendar):
                 log.warning("%s: no earnings date in the next 100 days in the calendar%s", symbol,
@@ -202,7 +207,8 @@ class TradingBot:
         in_position = symbol in positions
         armed = self._exit_armed(symbol, bars)
         sessions = self._session_days(now)
-        event = (forced_exit(symbol, decision_bar, self.calendar, sessions, self.scfg.earnings_exit_time) if in_position
+        event = (forced_exit(symbol, decision_bar, self.calendar, sessions, self.scfg.earnings_exit_time,
+                             self._sessions[2]) if in_position
                  else entry_blackout(symbol, decision_bar, self.calendar, sessions))
         state, reason_code = resolve_state(sig, in_position, self.scfg.exit_mode == "ema_cross" and armed,
                                            blackout=event is not None)
@@ -238,7 +244,7 @@ class TradingBot:
         elif state == LONG:
             cid = client_order_id(STRATEGY_TAG, symbol, decision_bar)
             block = self.risk.entry_block_reason(symbol, to_et(now).date(), set(positions) | set(self.pending),
-                                                 open_order_symbols, self.submitted_ids, cid)
+                                                 open_order_symbols | set(self.exit_pending), self.submitted_ids, cid)
             if block is None:
                 size = self.risk.size_position(ks.equity, float(sig["close"]), float(sig["atr"]),
                                                buying_power=_float(account.buying_power))
@@ -277,11 +283,13 @@ class TradingBot:
         today = to_et(now).date()
         if self._sessions[0] != today:
             try:
-                days = self.client.get_sessions(today - dt.timedelta(days=10), today + dt.timedelta(days=130))
-                self._sessions = (today, sorted(days))
+                closes = self.client.get_session_closes(today - dt.timedelta(days=10), today + dt.timedelta(days=130))
+                last_decision = {d: (dt.datetime.combine(d, dt.time.fromisoformat(c)) - dt.timedelta(minutes=30))
+                                 .strftime("%H:%M") for d, c in closes.items()}
+                self._sessions = (today, sorted(closes), last_decision)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Exchange calendar unavailable (%s); using weekday arithmetic", exc)
-                self._sessions = (today, None)
+                self._sessions = (today, None, None)
         return self._sessions[1]
 
     def _ratchet(self, symbol: str, bars: pd.DataFrame, sig: pd.Series) -> Optional[float]:
@@ -406,9 +414,8 @@ class TradingBot:
         except Exception as exc:  # noqa: BLE001
             self._exit_failed(symbol, now, f"close_position failed: {exc}")
             return
-        if order is None:  # no position at the broker: a bracket leg filled first; reconcile journals it
-            self.exit_pending.pop(symbol, None)
-            return
+        if order is None:  # no position at the broker (a leg or an earlier sell filled): reconcile journals
+            return         # it and consumes exit_pending, so the reason and reference price survive
         order = self.client.wait_for_terminal(order.id)
         status = _status(order)
         if status == FILLED:
@@ -429,8 +436,11 @@ class TradingBot:
         """Every open position must have a working sell stop. If it has had none for longer than
         the grace period (or right now, after a failed exit), place one at the tracked stop."""
         trade = self.trades.get(symbol)
-        if trade is None:
+        if trade is None or self.dry_run:
             return
+        working = self.client.get_open_orders([symbol])
+        if any(_kind(o) == "market" and str(getattr(o.side, "value", o.side)).lower() == "sell" for o in working):
+            return  # a liquidation is in flight; re-protecting would cancel it
         stop, _ = self.client.bracket_levels(symbol)
         if stop is not None:
             self.unprotected_since.pop(symbol, None)
@@ -439,7 +449,12 @@ class TradingBot:
         if not immediate and (now - first_seen).total_seconds() < UNPROTECTED_GRACE_SECONDS:
             return
         level = trade.stop_price if trade.stop_price is not None else trade.initial_stop
-        if level is None or self.dry_run:
+        if level is None or self.kill_switch_flattening:
+            why = "kill-switch active" if self.kill_switch_flattening else "no known stop level (adopted position)"
+            self.journal.log(J.ERROR, now=now, symbol=symbol, message=f"UNPROTECTED: {why}; closing at market")
+            self.exit_pending.setdefault(symbol, {"reason": "KILL_SWITCH" if self.kill_switch_flattening
+                                                  else "UNPROTECTED_EXIT", "ref": None, "attempts": 0,
+                                                  "order_id": None})
             return
         # Size from the broker, never from memory: protective sells on a position that has already
         # been sold would open a short if they triggered.
@@ -462,15 +477,27 @@ class TradingBot:
                                              "order_id": None}
 
     def _service_positions(self, positions: dict, now: pd.Timestamp, ks: KillSwitchStatus) -> None:
-        """Heartbeat duties: finish pending exits, retry pending ratchets, enforce stop coverage."""
+        """Heartbeat duties: earnings exits (from the calendar alone, so a market-data outage cannot
+        delay them), finish pending exits, retry pending ratchets, enforce stop coverage."""
+        if self.calendar and not self.dry_run:
+            sessions = self._session_days(now)
+            for symbol in list(self.trades):
+                if symbol in positions and symbol not in self.exit_pending:
+                    event = forced_exit(symbol, now, self.calendar, sessions, self.scfg.earnings_exit_time,
+                                        self._sessions[2])
+                    if event is not None:
+                        self.journal.log(J.BAR_CHECK, now=now, symbol=symbol, state=EXIT, reason_code=R_EARNINGS,
+                                         action="EXIT", in_position=True,
+                                         reason_detail=f"Earnings {event}: last hold session, exit time reached")
+                        self._submit_exit(symbol, None, now, ks, "EARNINGS_EXIT")
         for symbol in list(self.exit_pending):
             if symbol not in positions:
                 continue  # reconcile has journaled (or will journal) the exit fill
             pending = self.exit_pending[symbol]
             if pending["order_id"] is not None:
                 order = self.client.get_order(pending["order_id"])
-                if _status(order) in OPEN_STATUSES:
-                    continue
+                if _status(order) in OPEN_STATUSES or _status(order) in (FILLED, "calculated"):
+                    continue          # still working, or done and about to show up in reconcile
                 pending["order_id"] = None
             wait = min(self.ecfg.heartbeat_seconds * 2 ** max(pending["attempts"] - 1, 0), EXIT_RETRY_MAX_BACKOFF)
             last_try = pending.get("last_try")
@@ -487,9 +514,17 @@ class TradingBot:
             if symbol in positions and symbol not in self.exit_pending:
                 self._ensure_protection(symbol, now)
 
+    def _forget(self, symbol: str) -> Optional[OpenTrade]:
+        """A trade has left the book: drop every piece of per-symbol state with it, so nothing
+        (a pending exit, a ratchet, a protection timer) can act on the next position."""
+        self.exit_pending.pop(symbol, None)
+        self.desired_stop.pop(symbol, None)
+        self.unprotected_since.pop(symbol, None)
+        return self.trades.pop(symbol, None)
+
     def _record_exit_fill(self, symbol: str, order, ref_price: Optional[float], reason: str, now: pd.Timestamp,
                           equity: Optional[float], latency_ms: Optional[float] = None) -> None:
-        trade = self.trades.pop(symbol, None)
+        trade = self._forget(symbol)
         fill = float(order.filled_avg_price)
         qty = float(order.filled_qty)
         fields = {}
@@ -524,7 +559,7 @@ class TradingBot:
             since = (trade.entry_time - pd.Timedelta(minutes=2)).to_pydatetime()
             fill = self.client.find_latest_fill(symbol, "sell", since)
             if fill is None:
-                self.trades.pop(symbol)
+                self._forget(symbol)
                 self.journal.log(J.ERROR, now=now, symbol=symbol, message="Position closed but no sell fill found")
                 continue
             kind = _kind(fill)
@@ -562,7 +597,15 @@ class TradingBot:
             self.kill_switch_flattening = True
             self.pending.clear()
             self.desired_stop.clear()
-            self.client.flatten_all()
+            try:
+                self.client.flatten_all()
+            except Exception as exc:  # noqa: BLE001 - the retry loop below takes over
+                self.journal.log(J.ERROR, now=now, message=f"flatten_all failed: {exc}"[:500])
+            # Whatever is still held is closed by the heartbeat retry loop until it is gone.
+            for symbol in self.client.get_positions():
+                if symbol in self.trades:
+                    self.exit_pending.setdefault(symbol, {"reason": "KILL_SWITCH", "ref": None, "attempts": 1,
+                                                          "order_id": None, "last_try": now})
 
     # ------------------------------------------------------------------ loop
     def seconds_until_next_check(self) -> float:

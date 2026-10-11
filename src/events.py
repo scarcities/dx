@@ -16,9 +16,11 @@ the exit and AMC for the entry block, i.e. the safe side of both).
 With the exchange's session list (Alpaca calendar live, the bar dates in a backtest):
     L    = last session a position may be held: D for AMC, the session before D otherwise
     gap  = the session whose open carries the news: the session after D for AMC, D otherwise
-    exit : at the first decision bar at or after `exit_time` (default 14:30 ET) on L, and at
-           any decision bar after that until the gap (the bot also retries every heartbeat)
+    exit : at `exit_time` (default 14:30 ET) on L, or at L's last decision bar if L closes early
+           (half days), and at any time after that until the gap. The live bot checks this every
+           heartbeat from the calendar alone, so a market-data outage cannot delay it.
     no new entries from the session before L through the gap session
+An event dated on a non-session day (e.g. a Saturday) is moved to the next session as BMO.
 Without a session list, weekday arithmetic is used with one extra day of margin for holidays.
 """
 from __future__ import annotations
@@ -78,6 +80,10 @@ def _neighbours(day: dt.date, sessions: Optional[Sequence[dt.date]]) -> tuple[dt
 
 
 def event_window(date: dt.date, timing: str, sessions: Optional[Sequence[dt.date]] = None) -> EventWindow:
+    if sessions and date not in sessions:      # weekend/holiday report: the next open carries it
+        i = bisect.bisect_left(sessions, date)
+        if i < len(sessions):
+            date, timing = sessions[i], "BMO"
     before, before2, after = _neighbours(date, sessions)
     if timing == "AMC":
         last_hold, gap, block_from = date, after, before
@@ -100,12 +106,17 @@ def entry_blackout(symbol: str, ts, calendar: EarningsCalendar, sessions=None) -
     return None
 
 
-def forced_exit(symbol: str, ts, calendar: EarningsCalendar, sessions=None,
-                exit_time: str = "14:30") -> Optional[dt.date]:
-    """Event date if an open position must be closed at `ts`, else None."""
+def forced_exit(symbol: str, ts, calendar: EarningsCalendar, sessions=None, exit_time: str = "14:30",
+                last_decision: Optional[dict] = None) -> Optional[dt.date]:
+    """Event date if an open position must be closed at `ts`, else None. `last_decision` maps a
+    session date to its last decision time ("HH:MM") for early closes (e.g. "12:30" on a 13:00
+    close); the exit time on that day becomes the earlier of the two."""
     local = to_et(ts)
     day = local.date()
-    hours, minutes = (int(x) for x in exit_time.split(":"))
+    cutoff = exit_time
+    if last_decision and day in last_decision:
+        cutoff = min(exit_time, last_decision[day])
+    hours, minutes = (int(x) for x in cutoff.split(":"))
     for w in _windows(symbol, calendar, sessions):
         if (day == w.last_hold and (local.hour, local.minute) >= (hours, minutes)) or w.last_hold < day <= w.gap:
             return w.event
