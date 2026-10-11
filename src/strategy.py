@@ -15,6 +15,7 @@ import pandas as pd
 
 from config import StrategyConfig
 from src.indicators import add_indicators
+from src.risk_manager import round_price
 
 LONG, EXIT, WAIT = "LONG", "EXIT", "WAIT"
 
@@ -22,19 +23,26 @@ R_WARMUP = "WARMUP"
 R_CHOP = "CHOP_ADX_LOW"
 R_DEAD = "VOLATILITY_DEAD"
 R_SPIKE = "VOLATILITY_SPIKE"
+R_COST = "COST_TOO_HIGH"
 R_TREND = "TREND_FILTER"
+R_DI = "DI_BEARISH"
+R_NO_ANCHOR = "PULLBACK_TOO_LONG"
 R_NO_PULLBACK = "NO_RSI_PULLBACK"
 R_NO_CONFIRM = "NO_PRICE_CONFIRM"
 R_ENTRY = "ENTRY_PULLBACK_RECLAIM"
 R_EXIT = "EXIT_CLOSE_BELOW_EMA_FAST"
+R_TRAIL = "EXIT_RATCHET_STOP_AT_PRICE"
+R_TIME = "EXIT_MAX_HOLD"
+R_CALENDAR = "EARNINGS_CALENDAR_STALE"
+R_EARNINGS = "EARNINGS_BLACKOUT"
 R_HOLD = "IN_POSITION_HOLD"
 
 SNAPSHOT_COLUMNS = [
     "open", "high", "low", "close",
-    "ema_fast", "ema_slow", "rsi", "adx", "atr", "natr", "natr_lo", "natr_hi",
+    "ema_fast", "ema_slow", "rsi", "adx", "plus_di", "minus_di", "atr", "natr", "natr_lo", "natr_hi",
 ]
-FLAG_COLUMNS = ["warm", "chop", "dead", "spike", "trend_ok", "dipped", "crossed", "confirm", "entry", "exit",
-                "above_fast"]
+FLAG_COLUMNS = ["warm", "chop", "dead", "spike", "costly", "trend_ok", "no_anchor", "di_bear", "dipped", "crossed",
+                "confirm", "entry", "exit", "above_fast"]
 
 
 def evaluate_closed_bars(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
@@ -51,20 +59,45 @@ def evaluate_closed_bars(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
     warm = (bar_number < cfg.warmup_bars - 1) | ~required | rsi_min.isna() | rsi_prev.isna() | prev_high.isna()
 
     trend_ok = (ind["close"] > ind["ema_slow"]) & (ind["ema_fast"] > ind["ema_slow"])
-    chop = ind["adx"] < cfg.adx_min
+    n = len(ind)
+    false = pd.Series(False, index=ind.index)
+    # Anchor = last bar with RSI >= anchor_rsi at least rsi_dip_lookback bars back (causal: <= k-L).
+    positions = pd.Series(np.where(rsi >= cfg.anchor_rsi, np.arange(n), np.nan), index=ind.index)
+    anchor = positions.ffill().shift(cfg.rsi_dip_lookback)
+    anchor_age = pd.Series(np.arange(n), index=ind.index) - anchor
+    has_anchor = anchor.notna() & (anchor_age <= cfg.anchor_max_age)
+    take = anchor.fillna(0).astype(int).to_numpy()
+
+    def at_anchor(col: str) -> pd.Series:
+        return pd.Series(ind[col].to_numpy()[take], index=ind.index).where(has_anchor)
+
+    anchor_adx, anchor_pdi, anchor_mdi = at_anchor("adx"), at_anchor("plus_di"), at_anchor("minus_di")
+    if cfg.directional_check == "anchor":
+        no_anchor = ~has_anchor
+        chop = has_anchor & (anchor_adx < cfg.adx_min)
+        di_bear = has_anchor & (anchor_mdi >= anchor_pdi)
+    elif cfg.directional_check == "signal_bar":
+        no_anchor, chop = false, ind["adx"] < cfg.adx_min
+        di_bear = ind["minus_di"] >= ind["plus_di"]
+    elif cfg.directional_check is None:
+        no_anchor, chop, di_bear = false, ind["adx"] < cfg.adx_min, false
+    else:
+        raise ValueError(f"directional_check must be None, 'signal_bar' or 'anchor', got {cfg.directional_check!r}")
     dead = ind["natr"] < ind["natr_lo"]
     spike = ind["natr"] > ind["natr_hi"]
+    cost_r = cfg.round_trip_cost / (cfg.stop_atr_mult * ind["natr"])
+    costly = cost_r > cfg.max_cost_r if cfg.max_cost_r is not None else pd.Series(False, index=ind.index)
     dipped = rsi_min < trigger
     crossed = (rsi > trigger) & (rsi_prev <= trigger)
     confirm = ind["close"] > prev_high
 
-    entry = ~warm & ~chop & ~dead & ~spike & trend_ok & dipped & crossed & confirm
+    entry = ~warm & ~no_anchor & ~chop & ~dead & ~spike & ~costly & trend_ok & ~di_bear & dipped & crossed & confirm
     exit_ = ind["ema_fast"].notna() & (ind["close"] < ind["ema_fast"])
     above_fast = ind["close"] > ind["ema_fast"]
 
     reason = np.select(
-        [warm, chop, dead, spike, ~trend_ok, ~(dipped & crossed), ~confirm],
-        [R_WARMUP, R_CHOP, R_DEAD, R_SPIKE, R_TREND, R_NO_PULLBACK, R_NO_CONFIRM],
+        [warm, no_anchor, chop, dead, spike, costly, ~trend_ok, di_bear, ~(dipped & crossed), ~confirm],
+        [R_WARMUP, R_NO_ANCHOR, R_CHOP, R_DEAD, R_SPIKE, R_COST, R_TREND, R_DI, R_NO_PULLBACK, R_NO_CONFIRM],
         default=R_ENTRY,
     )
 
@@ -72,8 +105,14 @@ def evaluate_closed_bars(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
     out["rsi_prev"] = rsi_prev
     out["rsi_min"] = rsi_min
     out["prev_high"] = prev_high
-    for name, flag in zip(FLAG_COLUMNS, [warm, chop, dead, spike, trend_ok, dipped, crossed, confirm, entry, exit_,
-                                       above_fast]):
+    out["cost_r"] = cost_r
+    out["anchor_adx"], out["anchor_plus_di"], out["anchor_minus_di"] = anchor_adx, anchor_pdi, anchor_mdi
+    out["anchor_age"] = anchor_age.where(has_anchor)
+    flags = {"warm": warm, "chop": chop, "dead": dead, "spike": spike, "costly": costly, "trend_ok": trend_ok,
+             "no_anchor": no_anchor, "di_bear": di_bear, "dipped": dipped, "crossed": crossed, "confirm": confirm,
+             "entry": entry, "exit": exit_, "above_fast": above_fast}
+    assert list(flags) == FLAG_COLUMNS
+    for name, flag in flags.items():
         out[name] = flag.astype(bool)
     out["reason_code"] = reason
     out["ref_bar_time"] = out.index
@@ -109,9 +148,42 @@ def trailing_exit_armed(closed_bars: pd.DataFrame, since: pd.Timestamp, cfg: Str
     return bool((window["close"] > window["ema_fast"]).any())
 
 
-def resolve_state(sig: pd.Series, in_position: bool, exit_armed: bool = True) -> tuple[str, str]:
+def ratchet_stop(current_stop: float, entry_fill: float, entry_ref: float, initial_stop: float,
+                 highest_close: float, atr: float, cfg: StrategyConfig) -> float:
+    """Stop for an open long after the latest close ("ratchet" mode). Never below `current_stop`.
+
+    Inactive until the highest close since entry reaches entry_ref + trail_trigger_r * R, where
+    R = entry_ref - initial_stop (the planned risk; entry_ref is Close[t-1] at the signal, so the
+    trigger is identical in backtest and live). Then the stop is the higher of breakeven (the
+    actual entry fill plus the exit half of the round-trip cost) and highest_close - trail_atr_mult
+    * ATR. Moves smaller than max(ratchet_min_step_r * R, $0.02) are ignored to avoid order churn."""
+    risk = entry_ref - initial_stop
+    if cfg.exit_mode != "ratchet" or risk <= 0 or not np.isfinite(highest_close) or not np.isfinite(atr):
+        return current_stop
+    if highest_close < entry_ref + cfg.trail_trigger_r * risk:
+        return current_stop
+    breakeven = entry_fill * (1.0 + cfg.round_trip_cost / 2)
+    candidate = round_price(max(breakeven, highest_close - cfg.trail_atr_mult * atr))
+    if candidate - current_stop < max(cfg.ratchet_min_step_r * risk, 0.02):
+        return current_stop
+    return candidate
+
+
+def stop_too_close(stop: float, last_close: float, cfg: StrategyConfig) -> bool:
+    """A sell stop at or just under the market is rejected or fires at once: exit at market instead."""
+    return stop >= last_close * (1.0 - cfg.stop_buffer_pct)
+
+
+def resolve_state(sig: pd.Series, in_position: bool, ema_exit_allowed: bool = True,
+                  blackout: bool = False) -> tuple[str, str]:
+    """`ema_exit_allowed`: exit_mode is "ema_cross" and the exit is armed. `blackout`: an
+    earnings event is inside its blackout window (close positions, open nothing)."""
     if in_position:
-        return (EXIT, R_EXIT) if bool(sig["exit"]) and exit_armed else (WAIT, R_HOLD)
+        if blackout:
+            return EXIT, R_EARNINGS
+        return (EXIT, R_EXIT) if bool(sig["exit"]) and ema_exit_allowed else (WAIT, R_HOLD)
+    if blackout:
+        return WAIT, R_EARNINGS
     if bool(sig["entry"]):
         return LONG, R_ENTRY
     return WAIT, str(sig["reason_code"])
@@ -120,6 +192,8 @@ def resolve_state(sig: pd.Series, in_position: bool, exit_armed: bool = True) ->
 def describe(sig: pd.Series, cfg: StrategyConfig, in_position: bool = False, exit_armed: bool = True) -> str:
     """Human-readable, numeric explanation of the decision. [t-1] = last closed bar."""
     f, s = cfg.ema_fast, cfg.ema_slow
+    if in_position and cfg.exit_mode != "ema_cross":
+        return f"Holding: Close[t-1] {sig['close']:.2f}, ATR {sig['atr']:.2f}; {cfg.exit_mode} exit working"
     if in_position:
         if bool(sig["exit"]) and exit_armed:
             return f"Close[t-1] {sig['close']:.2f} < EMA{f}[t-1] {sig['ema_fast']:.2f}"
@@ -132,7 +206,14 @@ def describe(sig: pd.Series, cfg: StrategyConfig, in_position: bool = False, exi
         return f"Indicators not ready: need {cfg.warmup_bars} closed bars with valid EMA/RSI/ADX/ATR percentiles"
 
     parts = []
-    if bool(sig["chop"]):
+    anchored = cfg.directional_check == "anchor"
+    if bool(sig["no_anchor"]):
+        parts.append(f"{R_NO_ANCHOR}: no bar with RSI >= {cfg.anchor_rsi:.0f} between {cfg.rsi_dip_lookback} and "
+                     f"{cfg.anchor_max_age} bars back")
+    if bool(sig["chop"]) and anchored:
+        parts.append(f"{R_CHOP}: ADX at the pre-dip anchor ({sig['anchor_age']:.0f} bars back) "
+                     f"{sig['anchor_adx']:.2f} < {cfg.adx_min:.2f}")
+    elif bool(sig["chop"]):
         parts.append(f"{R_CHOP}: ADX[t-1] {sig['adx']:.2f} < {cfg.adx_min:.2f}")
     if bool(sig["dead"]):
         parts.append(f"{R_DEAD}: NATR[t-1] {sig['natr']:.4%} < P{cfg.natr_low_pct * 100:.0f} "
@@ -140,6 +221,9 @@ def describe(sig: pd.Series, cfg: StrategyConfig, in_position: bool = False, exi
     if bool(sig["spike"]):
         parts.append(f"{R_SPIKE}: NATR[t-1] {sig['natr']:.4%} > P{cfg.natr_high_pct * 100:.0f} "
                      f"{sig['natr_hi']:.4%} of last {cfg.natr_window} bars")
+    if bool(sig["costly"]):
+        parts.append(f"{R_COST}: round trip {cfg.round_trip_cost:.3%} / stop {cfg.stop_atr_mult * sig['natr']:.3%} "
+                     f"= {sig['cost_r']:.2f}R > {cfg.max_cost_r:.2f}R")
     if not bool(sig["trend_ok"]):
         why = []
         if not sig["close"] > sig["ema_slow"]:
@@ -147,6 +231,11 @@ def describe(sig: pd.Series, cfg: StrategyConfig, in_position: bool = False, exi
         if not sig["ema_fast"] > sig["ema_slow"]:
             why.append(f"EMA{f} {sig['ema_fast']:.2f} <= EMA{s} {sig['ema_slow']:.2f}")
         parts.append(f"{R_TREND}: " + " & ".join(why))
+    if bool(sig["di_bear"]) and anchored:
+        parts.append(f"{R_DI}: at the pre-dip anchor -DI {sig['anchor_minus_di']:.2f} >= +DI "
+                     f"{sig['anchor_plus_di']:.2f}")
+    elif bool(sig["di_bear"]):
+        parts.append(f"{R_DI}: -DI[t-1] {sig['minus_di']:.2f} >= +DI {sig['plus_di']:.2f}")
     if not bool(sig["dipped"]):
         parts.append(f"{R_NO_PULLBACK}: min RSI of last {cfg.rsi_dip_lookback} bars "
                      f"{sig['rsi_min']:.2f} >= {cfg.rsi_trigger:.2f}")
@@ -160,5 +249,6 @@ def describe(sig: pd.Series, cfg: StrategyConfig, in_position: bool = False, exi
         return " | ".join(parts)
     return (f"RSI {sig['rsi_prev']:.2f} -> {sig['rsi']:.2f} crossed {cfg.rsi_trigger:.2f} after dip to "
             f"{sig['rsi_min']:.2f}; Close[t-1] {sig['close']:.2f} > High[t-2] {sig['prev_high']:.2f}; "
-            f"ADX {sig['adx']:.2f}; NATR {sig['natr']:.4%} in [{sig['natr_lo']:.4%}, {sig['natr_hi']:.4%}]; "
+            f"ADX {sig['adx']:.2f} (+DI {sig['plus_di']:.1f}, -DI {sig['minus_di']:.1f}); "
+            f"NATR {sig['natr']:.4%} in [{sig['natr_lo']:.4%}, {sig['natr_hi']:.4%}], cost {sig['cost_r']:.2f}R; "
             f"Close > EMA{s} {sig['ema_slow']:.2f}, EMA{f} {sig['ema_fast']:.2f} > EMA{s}")

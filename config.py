@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -24,6 +25,17 @@ SOURCE_BAR_MINUTES = 30
 TIMEZONE = "America/New_York"
 
 JOURNAL_PATH = os.getenv("JOURNAL_PATH", "paper_trading_journal.csv")
+# symbol,date,timing rows (see src/events.py and earnings_calendar.example.csv).
+EARNINGS_CALENDAR_PATH = os.getenv("EARNINGS_CALENDAR", "earnings_calendar.csv")
+# Funds have no earnings; everything else needs calendar dates (the live bot fails closed without them).
+ETF_SYMBOLS = frozenset({"SPY", "QQQ", "DIA", "IWM"})
+BACKTEST_LEDGER_PATH = os.getenv("BACKTEST_LEDGER", "backtest_ledger.csv")
+
+# One cost assumption shared by the backtest fills and the strategy's cost floor, so they cannot
+# drift apart. 5 bp per side on market and stop fills (the original brief). Real costs for these
+# mega-caps are probably 1-3 bp; measure them in paper (evaluate_trust.py) and lower this once
+# you have 30+ fills. Lowering it also relaxes the cost floor.
+SLIPPAGE_PER_SIDE = float(os.getenv("SLIPPAGE_PER_SIDE", "0.0005"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 
 
@@ -49,10 +61,48 @@ class StrategyConfig:
     stop_atr_mult: float = 2.0
     target_atr_mult: float = 3.0
 
-    # "Trailing stop if Close < EMA_fast". Pullback entries often trigger while Close is
-    # still below EMA_fast, so the literal rule would exit one bar after entry. When True,
-    # the exit only arms after a close above EMA_fast since the signal bar. False = literal.
+    # Exit model (v2).
+    #   "bracket"   stop + target only (default: no tuned parameters).
+    #   "ratchet"   bracket, and once a close reaches entry_ref + trail_trigger_r * R the stop moves
+    #               to max(breakeven, highest close - trail_atr_mult * ATR), never lower. With
+    #               R = 2 ATR and a 1.5R target this is a breakeven stop that can lock at most +0.5R.
+    #   "ema_cross" v1: bracket plus an exit on a close below EMA_fast (noise-triggered on 1h bars).
+    # Optional time stop for any mode: exit at market after max_hold_bars closed bars in the trade.
+    exit_mode: str = "bracket"
+    trail_trigger_r: float = 1.0
+    trail_atr_mult: float = 2.0
+    ratchet_min_step_r: float = 0.10      # ignore stop moves smaller than 0.1R (or $0.02)
+    stop_buffer_pct: float = 0.002        # a new stop within 0.2% of the last close exits at market
+    max_hold_bars: Optional[int] = None
+
+    # ema_cross only. Pullback entries often fire while Close is still below EMA_fast, so the
+    # literal rule would exit one bar after entry; True arms it only after a close above EMA_fast.
     ema_exit_requires_arming: bool = True
+
+    # Cost floor (v2, OFF by default; set max_cost_r = 0.10 to enable). WAIT when the round-trip
+    # cost exceeds max_cost_r of the planned 1R stop, i.e. ATR/Close < round_trip_cost /
+    # (stop_atr_mult * max_cost_r). At 2 x 5 bp that floor is 0.50%: SPY is then never traded and
+    # QQQ rarely, so the "fix" is a universe change that rests on an unmeasured cost. Measure real
+    # slippage first (paper journal), set SLIPPAGE_PER_SIDE, then enable it.
+    round_trip_cost: float = 2 * SLIPPAGE_PER_SIDE
+    max_cost_r: Optional[float] = None
+
+    # Directional trend check (v2, OFF by default, hypothesis-grade).
+    #   None          v1: ADX[t-1] >= adx_min, no direction.
+    #   "signal_bar"  also +DI > -DI on t-1 (the proposal). RSI and DI share Wilder-14 smoothing,
+    #                 so right after RSI recovers from < 42, -DI still leads on ~90% of entries:
+    #                 this deletes almost every trade.
+    #   "anchor"      measure trend strength before the dip contaminates it: at the anchor bar (last
+    #                 bar with RSI >= anchor_rsi, between rsi_dip_lookback and anchor_max_age bars
+    #                 back) require ADX >= adx_min and +DI > -DI, INSTEAD of ADX on t-1. No anchor
+    #                 in range = WAIT (PULLBACK_TOO_LONG).
+    directional_check: Optional[str] = None
+    anchor_rsi: float = 50.0
+    anchor_max_age: int = 30
+
+    # Earnings (see src/events.py): open positions are closed at the first decision bar at or
+    # after this time on the last session before the gap.
+    earnings_exit_time: str = "14:30"
 
     # Closed bars required before any signal. EMA-200 seeded at bar 0 still carries
     # ~1.8% seed weight after 400 bars; fewer bars means a biased trend filter.
@@ -66,6 +116,8 @@ class RiskConfig:
     max_daily_drawdown: float = 0.03      # vs. previous close equity
     max_open_positions: int = 5
     kill_switch_flatten: bool = True      # flatten everything when the kill-switch trips
+    # Live only: no new entries in a stock whose calendar has no event in the next 100 days.
+    earnings_fail_closed: bool = True
 
 
 @dataclass(frozen=True)
@@ -90,7 +142,11 @@ class BacktestConfig:
     years: float = 2.0
     warmup_days: int = 120                # extra history fetched so indicators are converged
     initial_equity: float = 100_000.0
-    slippage_pct: float = 0.0005          # 0.05% per side, applied to every fill
+    slippage_pct: float = SLIPPAGE_PER_SIDE  # market entries, market/stop exits and gap fills
+    # A sell limit cannot fill below its price, so take-profit fills get no adverse slippage, but
+    # (queue position) they only count when the high trades through the target by a cent.
+    limit_slippage_pct: float = 0.0
+    tp_requires_trade_through: bool = True
     n_folds: int = 4                      # chronological walk-forward segments
 
 

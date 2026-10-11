@@ -22,6 +22,8 @@ ORDER_REJECTED = "ORDER_REJECTED"
 ORDER_PENDING = "ORDER_PENDING"
 ENTRY_FILL = "ENTRY_FILL"
 EXIT_FILL = "EXIT_FILL"
+STOP_RATCHET = "STOP_RATCHET"
+PROTECTIVE_STOP = "PROTECTIVE_STOP"
 KILL_SWITCH = "KILL_SWITCH"
 ERROR = "ERROR"
 STARTUP = "STARTUP"
@@ -32,7 +34,8 @@ COLUMNS = [
     # Decision context: the bar being traded (t) and the closed bar it is based on (t-1)
     "decision_bar_et", "ref_bar_et",
     "open", "high", "low", "close",
-    "ema_fast", "ema_slow", "rsi", "rsi_prev", "rsi_min", "prev_high", "adx", "atr", "natr", "natr_lo", "natr_hi",
+    "ema_fast", "ema_slow", "rsi", "rsi_prev", "rsi_min", "prev_high", "adx", "plus_di", "minus_di", "atr", "natr",
+    "natr_lo", "natr_hi", "cost_r",
     "state", "reason_code", "reason_detail", "action", "in_position",
     # Orders / fills
     "side", "qty", "ref_price", "fill_price", "slippage_bps",
@@ -43,8 +46,8 @@ COLUMNS = [
     "order_id", "client_order_id", "order_status", "latency_ms", "message",
 ]
 
-SNAPSHOT_FIELDS = ["open", "high", "low", "close", "ema_fast", "ema_slow", "rsi", "rsi_prev",
-                   "rsi_min", "prev_high", "adx", "atr", "natr", "natr_lo", "natr_hi"]
+SNAPSHOT_FIELDS = ["open", "high", "low", "close", "ema_fast", "ema_slow", "rsi", "rsi_prev", "rsi_min",
+                   "prev_high", "adx", "plus_di", "minus_di", "atr", "natr", "natr_lo", "natr_hi", "cost_r"]
 
 
 def slippage_bps(side: str, ref_price: float, fill_price: float) -> float:

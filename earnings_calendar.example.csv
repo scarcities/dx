@@ -1,0 +1,10 @@
+# Earnings calendar for the blackout (see src/events.py). Copy to earnings_calendar.csv and fill in.
+# One row per report: symbol, date (YYYY-MM-DD, the report day), timing = AMC (after the close),
+# BMO (before the open) or blank if unknown. AAPL, MSFT and NVDA normally report AMC.
+# Sources: each company's investor-relations page, or the filing time of the SEC 8-K (Item 2.02).
+# Funds in config.ETF_SYMBOLS (SPY, QQQ, ...) need no rows.
+#
+# Live bot: a stock with no date in the next 100 days gets no new entries (fails closed).
+# Backtest: past dates are needed too, ~4 per year per stock, or the run warns that gap risk
+# is understated. Do not invent dates: a wrong date is worse than a missing one.
+symbol,date,timing

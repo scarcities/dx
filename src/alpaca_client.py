@@ -23,15 +23,22 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, StopLossRequest, TakeProfitRequest
+from alpaca.trading.requests import (GetCalendarRequest, GetOrdersRequest, LimitOrderRequest, MarketOrderRequest,
+                                     ReplaceOrderRequest, StopLossRequest, StopOrderRequest, TakeProfitRequest)
 
 from config import SOURCE_BAR_MINUTES, ExecutionConfig
+from src.risk_manager import round_price
 from src.sessions import complete_bars, in_trading_window, to_session_bars
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
 
-TERMINAL_STATUSES = {"filled", "canceled", "expired", "rejected", "done_for_day", "stopped", "suspended"}
+TERMINAL_STATUSES = {"filled", "canceled", "expired", "rejected", "done_for_day", "stopped", "suspended", "replaced"}
+WORKING_STATUSES = {"new", "held", "accepted", "pending_new", "accepted_for_bidding", "partially_filled"}
+
+
+class ExitBlocked(RuntimeError):
+    """The bracket legs could not be cancelled in time, so a market sell would be rejected."""
 
 
 def enum_value(value) -> str:
@@ -119,6 +126,11 @@ class AlpacaClient:
         return bool(clock.is_open) and in_trading_window(now, self.cfg.trade_window_start,
                                                          self.cfg.trade_window_end)
 
+    def get_sessions(self, start: dt.date, end: dt.date) -> list:
+        """Exchange trading days (holidays excluded) from Alpaca's calendar."""
+        request = GetCalendarRequest(start=start, end=end)
+        return [c.date for c in self._call("get_calendar", self.trading.get_calendar, request)]
+
     def get_positions(self) -> dict:
         return {p.symbol: p for p in self._call("get_all_positions", self.trading.get_all_positions)}
 
@@ -193,18 +205,61 @@ class AlpacaClient:
 
     def close_position(self, symbol: str):
         """Cancel the bracket legs (they reserve the shares), then market-sell the position.
-        Returns the closing order, or None if the position no longer exists."""
+        Returns the closing order, or None only if the broker has no such position (404).
+        Raises ExitBlocked if legs are still open after the cancel wait: selling then would be
+        rejected for held shares and must not be mistaken for "already closed"."""
         self.cancel_symbol_orders(symbol)
+        if self.get_open_orders([symbol]):
+            raise ExitBlocked(f"{symbol}: bracket legs still open after cancel; exit not sent")
         try:
             return self._call(f"close_position({symbol})", self.trading.close_position, symbol)
         except APIError as exc:
-            if exc.status_code in (404, 422):
-                log.warning("close_position(%s): %s", symbol, exc)
+            if exc.status_code == 404:
+                log.warning("close_position(%s): no position (%s)", symbol, exc)
                 return None
             raise
 
     def flatten_all(self):
         return self._call("close_all_positions", self.trading.close_all_positions, cancel_orders=True)
+
+    def working_stop_legs(self, symbol: str) -> list:
+        return [o for o in self.get_open_orders([symbol])
+                if enum_value(o.side) == "sell" and enum_value(o.order_type or o.type) in ("stop", "stop_limit")
+                and enum_value(o.status) in WORKING_STATUSES]
+
+    def replace_stop(self, symbol: str, stop_price: float):
+        """Raise the working stop leg of a bracket with ONE attempt: a replace is not idempotent,
+        so a timed-out-but-applied PATCH must not be resent. Raises on any problem; the caller
+        re-reads the broker's stop and keeps the old one, which is still working."""
+        legs = self.working_stop_legs(symbol)
+        if len(legs) != 1:
+            raise RuntimeError(f"{symbol}: expected exactly one working stop leg, found {len(legs)}")
+        request = ReplaceOrderRequest(stop_price=round_price(stop_price))
+        return self.trading.replace_order_by_id(legs[0].id, request)
+
+    def restore_protection(self, symbol: str, qty: float, stop_price: float, take_profit: Optional[float]) -> str:
+        """Re-protect a position that has lost its stop leg. Any remaining leg (e.g. an orphaned
+        take-profit) holds the shares and would get a new stop rejected, so everything working on
+        the symbol is cancelled first; then an OCO (target + stop) is placed, falling back to a
+        plain GTC stop. Returns "oco" or "stop"; raises if nothing could be placed."""
+        self.cancel_symbol_orders(symbol)
+        if self.get_open_orders([symbol]):
+            raise ExitBlocked(f"{symbol}: orders still open after cancel; cannot re-protect yet")
+        stop = StopLossRequest(stop_price=round_price(stop_price))
+        if take_profit is not None:
+            target = round_price(take_profit)
+            oco = LimitOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
+                                    order_class=OrderClass.OCO, limit_price=target,
+                                    take_profit=TakeProfitRequest(limit_price=target), stop_loss=stop)
+            try:
+                self._call(f"protect_oco({symbol})", self.trading.submit_order, oco)
+                return "oco"
+            except APIError as exc:
+                log.warning("OCO re-protection for %s rejected (%s); placing a plain stop", symbol, exc)
+        plain = StopOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
+                                 stop_price=stop.stop_price)
+        self._call(f"protect_stop({symbol})", self.trading.submit_order, plain)
+        return "stop"
 
     def bracket_levels(self, symbol: str) -> tuple[Optional[float], Optional[float]]:
         """(stop_price, take_profit) of the working sell legs for a symbol, if any."""

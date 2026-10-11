@@ -27,12 +27,19 @@ import pandas as pd
 import config
 from config import ExecutionConfig, RiskConfig, StrategyConfig
 from src import journal as J
+from src.events import EarningsCalendar, entry_blackout, forced_exit, has_upcoming_event, load_earnings_calendar
 from src.journal import TradeJournal, slippage_bps
 from src.risk_manager import KillSwitchStatus, RiskManager, client_order_id, r_multiple
 from src.sessions import in_trading_window, latest_bar_end, to_et
-from src.strategy import EXIT, LONG, decide_latest, describe, resolve_state, trailing_exit_armed
+from src.strategy import (EXIT, LONG, R_CALENDAR, R_EARNINGS, R_EXIT, R_TIME, R_TRAIL, WAIT, decide_latest, describe,
+                          ratchet_stop, resolve_state, stop_too_close, trailing_exit_armed)
 
-STRATEGY_TAG = "tpb1"
+STRATEGY_TAG = "tpb2"  # v2 rules; keeps client_order_ids and journals apart from v1
+EXIT_LABELS = {R_EXIT: "EMA_EXIT", R_EARNINGS: "EARNINGS_EXIT", R_TRAIL: "TRAIL_STOP", R_TIME: "TIME_EXIT"}
+OPEN_STATUSES = {"new", "held", "accepted", "pending_new", "accepted_for_bidding", "partially_filled"}
+MAX_RATCHET_ATTEMPTS = 3          # per bar, one per heartbeat
+UNPROTECTED_GRACE_SECONDS = 60    # a position with no working stop for this long gets a new one
+EXIT_RETRY_MAX_BACKOFF = 600      # failed exits are retried after 30s, 60s, 120s ... capped at 10 min
 FILLED = "filled"
 DEAD_ORDER = {"canceled", "expired", "rejected", "done_for_day", "stopped", "suspended"}
 
@@ -62,11 +69,18 @@ class OpenTrade:
     qty: float
     entry_price: float
     entry_time: pd.Timestamp
-    stop_price: Optional[float]
+    stop_price: Optional[float]           # the stop currently working at the broker
     take_profit: Optional[float]
-    ref_bar: Optional[pd.Timestamp]       # signal bar; arms the trailing EMA exit
+    ref_bar: Optional[pd.Timestamp]       # signal bar (t-1 at entry); later bars feed the ratchet
     planned_risk: Optional[float] = None
     client_order_id: str = ""
+    initial_stop: Optional[float] = None
+    entry_ref: Optional[float] = None     # Close[t-1] at the signal; the ratchet's R is measured from it
+
+    @property
+    def trailed(self) -> bool:
+        return (self.stop_price is not None and self.initial_stop is not None
+                and self.stop_price > self.initial_stop + 1e-9)
 
 
 class TradingBot:
@@ -74,17 +88,22 @@ class TradingBot:
                  strategy_cfg: StrategyConfig = StrategyConfig(), risk_cfg: RiskConfig = RiskConfig(),
                  exec_cfg: ExecutionConfig = ExecutionConfig(), dry_run: bool = False,
                  now_fn: Callable[[], pd.Timestamp] = lambda: pd.Timestamp.now(tz="UTC"),
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep, calendar: Optional[EarningsCalendar] = None):
         self.client = client
         self.journal = journal
         self.symbols = list(symbols)
         self.scfg, self.rcfg, self.ecfg = strategy_cfg, risk_cfg, exec_cfg
         self.risk = RiskManager(risk_cfg, strategy_cfg)
         self.dry_run = dry_run
+        self.calendar = calendar or {}
         self.now_fn = now_fn
         self.sleep = sleep
         self.trades: dict[str, OpenTrade] = {}
         self.pending: dict[str, dict] = {}
+        self.exit_pending: dict[str, dict] = {}       # exits that did not complete; retried every heartbeat
+        self.desired_stop: dict[str, dict] = {}       # ratchets that did not complete; retried every heartbeat
+        self.unprotected_since: dict[str, pd.Timestamp] = {}
+        self._sessions: tuple = (None, None)          # (ET date fetched, exchange session dates)
         self.submitted_ids: set[str] = set()
         self.last_decision_bar: dict[str, pd.Timestamp] = {}
         self.last_processed_end: Optional[pd.Timestamp] = None
@@ -107,16 +126,21 @@ class TradingBot:
                 ref, j_stop = _float(entry.get("ref_price")), _float(entry.get("stop_price"))
                 ref_bar = entry.get("ref_bar_et")
                 trade = OpenTrade(symbol, _float(entry.get("qty")) or 0.0, _float(entry.get("fill_price")) or 0.0,
-                                  pd.Timestamp(entry["ts_utc"]), j_stop, _float(entry.get("take_profit")),
-                                  ref_bar if pd.notna(ref_bar) else None,
+                                  pd.Timestamp(entry["ts_utc"]), stop if stop is not None else j_stop,
+                                  _float(entry.get("take_profit")), ref_bar if pd.notna(ref_bar) else None,
                                   ref - j_stop if ref is not None and j_stop is not None else None,
-                                  str(entry.get("client_order_id") or ""))
+                                  str(entry.get("client_order_id") or ""), j_stop, ref)
             else:
-                trade = OpenTrade(symbol, float(pos.qty), float(pos.avg_entry_price), now, stop, target, None)
+                trade = OpenTrade(symbol, float(pos.qty), float(pos.avg_entry_price), now, stop, target, None,
+                                  initial_stop=stop, entry_ref=float(pos.avg_entry_price))
                 log.warning("Adopting %s position not found in the journal (qty %s)", symbol, pos.qty)
             self.trades[symbol] = trade
             if pos is not None and stop is None:
                 self.journal.log(J.ERROR, now=now, symbol=symbol, message="Open position has no working stop order")
+        for symbol in self.symbols:
+            if symbol not in config.ETF_SYMBOLS and not has_upcoming_event(symbol, now, self.calendar):
+                log.warning("%s: no earnings date in the next 100 days in the calendar%s", symbol,
+                            "; new entries are blocked (fail closed)" if self.rcfg.earnings_fail_closed else "")
         account = self.client.get_account()
         self.journal.log(J.STARTUP, now=now, equity=float(account.equity),
                          day_start_equity=float(account.last_equity),
@@ -140,6 +164,7 @@ class TradingBot:
 
         positions = self.client.get_positions()
         self._reconcile(positions, now, status)
+        self._service_positions(positions, now, status)
 
         if not in_trading_window(now, self.ecfg.trade_window_start, self.ecfg.trade_window_end):
             return "OUTSIDE_WINDOW"
@@ -176,13 +201,39 @@ class TradingBot:
         sig = decide_latest(bars, self.scfg)
         in_position = symbol in positions
         armed = self._exit_armed(symbol, bars)
-        state, reason_code = resolve_state(sig, in_position, armed)
+        sessions = self._session_days(now)
+        event = (forced_exit(symbol, decision_bar, self.calendar, sessions, self.scfg.earnings_exit_time) if in_position
+                 else entry_blackout(symbol, decision_bar, self.calendar, sessions))
+        state, reason_code = resolve_state(sig, in_position, self.scfg.exit_mode == "ema_cross" and armed,
+                                           blackout=event is not None)
         detail = describe(sig, self.scfg, in_position, armed)
+        if event is not None:
+            detail = f"Earnings {event} inside its blackout window | {detail}"
+        elif (state == LONG and self.rcfg.earnings_fail_closed and symbol not in config.ETF_SYMBOLS
+              and not has_upcoming_event(symbol, decision_bar, self.calendar)):
+            state, reason_code = WAIT, R_CALENDAR
+            detail = f"{R_CALENDAR}: no {symbol} earnings date in the next 100 days in the calendar | {detail}"
+        new_stop = None
+        trade = self.trades.get(symbol)
+        if in_position and state != EXIT and trade is not None and trade.ref_bar is not None:
+            held = int((bars.index > pd.Timestamp(trade.ref_bar)).sum())
+            if self.scfg.max_hold_bars and held >= self.scfg.max_hold_bars:
+                state, reason_code = EXIT, R_TIME
+                detail = f"{held} bars in the trade >= max_hold_bars {self.scfg.max_hold_bars}"
+            else:
+                new_stop = self._ratchet(symbol, bars, sig)
+                if new_stop is not None and stop_too_close(new_stop, float(sig["close"]), self.scfg):
+                    state, reason_code = EXIT, R_TRAIL
+                    detail = (f"Ratcheted stop {new_stop:.2f} within {self.scfg.stop_buffer_pct:.1%} of "
+                              f"Close[t-1] {sig['close']:.2f}: exit at market")
+                    new_stop = None
+                elif new_stop is not None:
+                    detail += f"; stop {trade.stop_price:.2f} -> {new_stop:.2f}"
         account_fields = {"equity": ks.equity, "day_start_equity": ks.day_start_equity,
                           "daily_pnl_pct": ks.daily_pnl_pct}
 
         action, size, cid = ("HOLD" if in_position else "NONE"), None, ""
-        if stale:
+        if stale and state == LONG:          # exits and stop ratchets reduce risk, so they still run
             action = "SKIPPED_STALE"
         elif state == LONG:
             cid = client_order_id(STRATEGY_TAG, symbol, decision_bar)
@@ -193,8 +244,12 @@ class TradingBot:
                                                buying_power=_float(account.buying_power))
                 block = "SIZE_ZERO" if size.shares < 1 else None
             action = f"BLOCKED_{block}" if block else ("DRY_RUN_ENTER" if self.dry_run else "ENTER")
+        elif state == EXIT and symbol in self.exit_pending:
+            action = "EXIT_PENDING"          # already being worked by the heartbeat retry loop
         elif state == EXIT:
             action = "DRY_RUN_EXIT" if self.dry_run else "EXIT"
+        elif new_stop is not None:
+            action = "DRY_RUN_RATCHET_STOP" if self.dry_run else "RATCHET_STOP"
 
         sizing = {}
         if size is not None:
@@ -210,8 +265,78 @@ class TradingBot:
         if action == "ENTER":
             self._submit_entry(symbol, sig, size, cid, now, ks)
         elif action == "EXIT":
-            self._submit_exit(symbol, sig, now, ks)
+            self._submit_exit(symbol, float(sig["close"]), now, ks, EXIT_LABELS.get(reason_code, "MARKET_EXIT"))
+        elif action == "RATCHET_STOP":
+            self.desired_stop[symbol] = {"stop": new_stop, "attempts": 0}
+            self._try_ratchet(symbol, now)
         return True
+
+    def _session_days(self, now: pd.Timestamp):
+        """Exchange sessions around today from the broker calendar, refreshed once a day. On
+        failure the event windows fall back to weekday arithmetic with an extra day of margin."""
+        today = to_et(now).date()
+        if self._sessions[0] != today:
+            try:
+                days = self.client.get_sessions(today - dt.timedelta(days=10), today + dt.timedelta(days=130))
+                self._sessions = (today, sorted(days))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Exchange calendar unavailable (%s); using weekday arithmetic", exc)
+                self._sessions = (today, None)
+        return self._sessions[1]
+
+    def _ratchet(self, symbol: str, bars: pd.DataFrame, sig: pd.Series) -> Optional[float]:
+        """New (higher) stop for an open position, or None. Same inputs as the backtester: closes
+        of the bars after the signal bar, ATR[t-1], the entry fill, and the stop working at the
+        broker (re-read every bar, so a restart or a half-failed replace heals itself). Adopted
+        positions of unknown provenance are never ratcheted."""
+        trade = self.trades.get(symbol)
+        if self.scfg.exit_mode != "ratchet" or trade is None or trade.ref_bar is None:
+            return None
+        working_stop, _ = self.client.bracket_levels(symbol)
+        if working_stop is not None:
+            trade.stop_price = working_stop
+        if None in (trade.stop_price, trade.initial_stop, trade.entry_ref):
+            return None
+        closes = bars.loc[bars.index > pd.Timestamp(trade.ref_bar), "close"]
+        highest = float(closes.max()) if len(closes) else float("-inf")
+        new_stop = ratchet_stop(trade.stop_price, trade.entry_price, trade.entry_ref, trade.initial_stop, highest,
+                                float(sig["atr"]), self.scfg)
+        return new_stop if new_stop > trade.stop_price + 1e-9 else None
+
+    def _try_ratchet(self, symbol: str, now: pd.Timestamp) -> None:
+        """One replace attempt for the desired stop. The PATCH is not retried blindly (it is not
+        idempotent); after an error the broker's stop is re-read and treated as the truth."""
+        want = self.desired_stop.get(symbol)
+        trade = self.trades.get(symbol)
+        if want is None or trade is None:
+            self.desired_stop.pop(symbol, None)
+            return
+        want["attempts"] += 1
+        old, new_stop = trade.stop_price, want["stop"]
+        try:
+            order = self.client.replace_stop(symbol, new_stop)
+            confirmed = True
+        except Exception as exc:  # noqa: BLE001 - the old stop stays in force, so this fails safe
+            order, confirmed = None, False
+            working, _ = self.client.bracket_levels(symbol)
+            if working is not None and working >= new_stop - 1e-9:
+                confirmed = True                     # the replace went through despite the error
+            else:
+                give_up = want["attempts"] >= MAX_RATCHET_ATTEMPTS
+                self.journal.log(J.ERROR, now=now, symbol=symbol, stop_price=working if working is not None else old,
+                                 message=(f"Stop ratchet {old} -> {new_stop} failed (attempt {want['attempts']}"
+                                          f"{', giving up for this bar' if give_up else ''}); old stop kept: {exc}")[:500])
+                log.error("Stop ratchet %s %s -> %s failed: %s", symbol, old, new_stop, exc)
+                if give_up:
+                    self.desired_stop.pop(symbol, None)
+                return
+        if confirmed:
+            trade.stop_price = new_stop
+            self.desired_stop.pop(symbol, None)
+            self.journal.log(J.STOP_RATCHET, now=now, symbol=symbol, stop_price=new_stop,
+                             entry_price=trade.entry_price, order_id=str(getattr(order, "id", "")),
+                             message=f"stop {old:.2f} -> {new_stop:.2f}")
+            log.info("STOP RATCHET %s %.2f -> %.2f", symbol, old, new_stop)
 
     def _exit_armed(self, symbol: str, bars: pd.DataFrame) -> bool:
         trade = self.trades.get(symbol)
@@ -257,7 +382,8 @@ class TradingBot:
         qty = float(order.filled_qty)
         risk_pct = qty * (fill - pending["stop"]) / equity if equity else float("nan")
         self.trades[symbol] = OpenTrade(symbol, qty, fill, pd.Timestamp(order.filled_at or now), pending["stop"],
-                                        pending["target"], pending["ref_bar"], pending["planned_risk"], pending["cid"])
+                                        pending["target"], pending["ref_bar"], pending["planned_risk"], pending["cid"],
+                                        initial_stop=pending["stop"], entry_ref=pending["ref_price"])
         self.journal.log(J.ENTRY_FILL, now=now, symbol=symbol, side="buy", qty=qty, ref_price=pending["ref_price"],
                          fill_price=fill, slippage_bps=slippage_bps("buy", pending["ref_price"], fill),
                          stop_price=pending["stop"], take_profit=pending["target"], entry_price=fill,
@@ -267,20 +393,99 @@ class TradingBot:
         log.info("ENTRY FILL %s %s @ %.2f (ref %.2f, stop %.2f, target %.2f)", symbol, qty, fill,
                  pending["ref_price"], pending["stop"], pending["target"])
 
-    def _submit_exit(self, symbol: str, sig: pd.Series, now: pd.Timestamp, ks: KillSwitchStatus) -> None:
+    def _submit_exit(self, symbol: str, ref_price: Optional[float], now: pd.Timestamp, ks: KillSwitchStatus,
+                     reason: str) -> None:
+        """Market exit. If it does not complete, the symbol goes on the exit_pending list: it is
+        re-protected with a stop if needed and the exit is retried on every heartbeat."""
         started = time.monotonic()
+        self.exit_pending.setdefault(symbol, {"reason": reason, "ref": ref_price, "attempts": 0, "order_id": None})
+        self.exit_pending[symbol]["attempts"] += 1
+        self.exit_pending[symbol]["last_try"] = now
         try:
             order = self.client.close_position(symbol)
         except Exception as exc:  # noqa: BLE001
-            self.journal.log(J.ERROR, now=now, symbol=symbol, message=f"close_position failed: {exc}"[:500])
-            log.error("Exit %s failed: %s", symbol, exc)
+            self._exit_failed(symbol, now, f"close_position failed: {exc}")
             return
-        if order is None:  # bracket leg filled first; reconciliation will journal it
+        if order is None:  # no position at the broker: a bracket leg filled first; reconcile journals it
+            self.exit_pending.pop(symbol, None)
             return
         order = self.client.wait_for_terminal(order.id)
-        if _status(order) == FILLED:
-            self._record_exit_fill(symbol, order, float(sig["close"]), "EMA_EXIT", now, ks.equity,
-                                   (time.monotonic() - started) * 1000)
+        status = _status(order)
+        if status == FILLED:
+            self.exit_pending.pop(symbol, None)
+            self._record_exit_fill(symbol, order, ref_price, reason, now, ks.equity, (time.monotonic() - started) * 1000)
+        elif status in DEAD_ORDER:
+            self._exit_failed(symbol, now, f"close order {order.id} ended {status}")
+        else:
+            self.exit_pending[symbol]["order_id"] = order.id   # still working; checked every heartbeat
+
+    def _exit_failed(self, symbol: str, now: pd.Timestamp, message: str) -> None:
+        self.journal.log(J.ERROR, now=now, symbol=symbol, message=f"EXIT_FAILED: {message}; retrying"[:500])
+        log.error("Exit %s failed: %s", symbol, message)
+        self.exit_pending[symbol]["order_id"] = None
+        self._ensure_protection(symbol, now, immediate=True)
+
+    def _ensure_protection(self, symbol: str, now: pd.Timestamp, immediate: bool = False) -> None:
+        """Every open position must have a working sell stop. If it has had none for longer than
+        the grace period (or right now, after a failed exit), place one at the tracked stop."""
+        trade = self.trades.get(symbol)
+        if trade is None:
+            return
+        stop, _ = self.client.bracket_levels(symbol)
+        if stop is not None:
+            self.unprotected_since.pop(symbol, None)
+            return
+        first_seen = self.unprotected_since.setdefault(symbol, now)
+        if not immediate and (now - first_seen).total_seconds() < UNPROTECTED_GRACE_SECONDS:
+            return
+        level = trade.stop_price if trade.stop_price is not None else trade.initial_stop
+        if level is None or self.dry_run:
+            return
+        # Size from the broker, never from memory: protective sells on a position that has already
+        # been sold would open a short if they triggered.
+        held = self.client.get_positions().get(symbol)
+        qty = abs(float(held.qty)) if held is not None else 0.0
+        if qty <= 0:
+            self.unprotected_since.pop(symbol, None)
+            return
+        try:
+            kind = self.client.restore_protection(symbol, qty, level, trade.take_profit)
+            self.unprotected_since.pop(symbol, None)
+            self.journal.log(J.PROTECTIVE_STOP, now=now, symbol=symbol, qty=qty, stop_price=level,
+                             take_profit=trade.take_profit if kind == "oco" else None,
+                             message=f"no working stop found; protection restored as {kind.upper()}")
+        except Exception as exc:  # noqa: BLE001
+            self.journal.log(J.ERROR, now=now, symbol=symbol, stop_price=level,
+                             message=f"UNPROTECTED: protective stop rejected ({exc}); closing at market"[:500])
+            if symbol not in self.exit_pending:
+                self.exit_pending[symbol] = {"reason": "UNPROTECTED_EXIT", "ref": None, "attempts": 0,
+                                             "order_id": None}
+
+    def _service_positions(self, positions: dict, now: pd.Timestamp, ks: KillSwitchStatus) -> None:
+        """Heartbeat duties: finish pending exits, retry pending ratchets, enforce stop coverage."""
+        for symbol in list(self.exit_pending):
+            if symbol not in positions:
+                continue  # reconcile has journaled (or will journal) the exit fill
+            pending = self.exit_pending[symbol]
+            if pending["order_id"] is not None:
+                order = self.client.get_order(pending["order_id"])
+                if _status(order) in OPEN_STATUSES:
+                    continue
+                pending["order_id"] = None
+            wait = min(self.ecfg.heartbeat_seconds * 2 ** max(pending["attempts"] - 1, 0), EXIT_RETRY_MAX_BACKOFF)
+            last_try = pending.get("last_try")
+            if last_try is not None and (now - last_try).total_seconds() < wait - 1:
+                continue
+            if not self.dry_run:
+                self._submit_exit(symbol, pending["ref"], now, ks, pending["reason"])
+        for symbol in list(self.desired_stop):
+            if symbol in positions and symbol not in self.exit_pending:
+                self._try_ratchet(symbol, now)
+            else:
+                self.desired_stop.pop(symbol, None)
+        for symbol in list(self.trades):
+            if symbol in positions and symbol not in self.exit_pending:
+                self._ensure_protection(symbol, now)
 
     def _record_exit_fill(self, symbol: str, order, ref_price: Optional[float], reason: str, now: pd.Timestamp,
                           equity: Optional[float], latency_ms: Optional[float] = None) -> None:
@@ -289,8 +494,8 @@ class TradingBot:
         qty = float(order.filled_qty)
         fields = {}
         if trade is not None:
-            r_value = r_multiple(trade.entry_price, fill, trade.stop_price, trade.planned_risk) \
-                if trade.stop_price is not None else None
+            initial = trade.initial_stop if trade.initial_stop is not None else trade.stop_price
+            r_value = r_multiple(trade.entry_price, fill, initial, trade.planned_risk) if initial is not None else None
             fields = {"entry_price": trade.entry_price, "r_multiple": r_value,
                       "pnl": qty * (fill - trade.entry_price), "stop_price": trade.stop_price,
                       "take_profit": trade.take_profit}
@@ -323,10 +528,15 @@ class TradingBot:
                 self.journal.log(J.ERROR, now=now, symbol=symbol, message="Position closed but no sell fill found")
                 continue
             kind = _kind(fill)
+            pending_exit = self.exit_pending.pop(symbol, None)
+            self.desired_stop.pop(symbol, None)
+            self.unprotected_since.pop(symbol, None)
             if self.kill_switch_flattening and kind == "market":
                 reason, ref = "KILL_SWITCH", None
+            elif pending_exit is not None and kind == "market":
+                reason, ref = pending_exit["reason"], pending_exit["ref"]
             elif kind in ("stop", "stop_limit"):
-                reason, ref = "STOP_LOSS", _float(fill.stop_price)
+                reason, ref = ("TRAIL_STOP" if trade.trailed else "STOP_LOSS"), _float(fill.stop_price)
             elif kind == "limit":
                 reason, ref = "TAKE_PROFIT", _float(fill.limit_price)
             else:
@@ -351,6 +561,7 @@ class TradingBot:
         if self.rcfg.kill_switch_flatten and not self.dry_run:
             self.kill_switch_flattening = True
             self.pending.clear()
+            self.desired_stop.clear()
             self.client.flatten_all()
 
     # ------------------------------------------------------------------ loop
@@ -418,6 +629,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.critical("ALPACA_PAPER is not True. This bot is in a paper validation phase and refuses live trading.")
         return 2
     exec_cfg = ExecutionConfig()
+    calendar = load_earnings_calendar(config.EARNINGS_CALENDAR_PATH)
+    single_names = [s for s in config.SYMBOLS if s not in ("SPY", "QQQ")]
+    if not calendar:
+        log.warning("No earnings calendar at %s: %s can be held through earnings gaps. See src/events.py.",
+                    config.EARNINGS_CALENDAR_PATH, ", ".join(single_names))
+    elif missing := [s for s in single_names if s not in calendar]:
+        log.warning("Earnings calendar has no dates for %s", ", ".join(missing))
     client = AlpacaClient(key, secret, paper, exec_cfg)
     account = client.get_account()
     if account.trading_blocked or account.account_blocked:
@@ -427,7 +645,7 @@ def main(argv: Optional[list[str]] = None) -> int:
              account.equity, exec_cfg.data_feed)
 
     bot = TradingBot(client, TradeJournal(args.journal), config.SYMBOLS, StrategyConfig(), RiskConfig(), exec_cfg,
-                     dry_run=args.dry_run)
+                     dry_run=args.dry_run, calendar=calendar)
     signal.signal(signal.SIGINT, bot.stop)
     signal.signal(signal.SIGTERM, bot.stop)
     if args.once:
