@@ -701,6 +701,18 @@ def test_breakeven_cost_accounts_for_stop_width_and_exit_type():
     assert breakeven_cost_bps(targets) == pytest.approx(0.2 * 0.01 * 1e4)
 
 
+def test_cluster_random_drop_null_keeps_exactly_k_signals():
+    from backtest import cluster_random_drop_percentile
+
+    r = np.arange(20, dtype=float)                     # 4 weeks x 5 signals, distinct values
+    weeks = np.repeat([1, 2, 3, 4], 5)
+    overall = r.mean()
+    # Dropping a single signal: draws must not all equal the full-sample mean (which would make
+    # any filter look like it beats "random").
+    assert cluster_random_drop_percentile(r, weeks, overall + 1e-9, k=19, draws=500) < 0.9
+    assert 0.0 < cluster_random_drop_percentile(r, weeks, overall, k=10, draws=500) < 1.0
+
+
 def test_take_profit_needs_a_trade_through(portfolio):
     df = portfolio["SYN7"][OHLC]
     touch = Backtester(strategy_cfg=V1, bt_cfg=BacktestConfig(tp_requires_trade_through=False)).run({"S": df})

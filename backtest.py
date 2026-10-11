@@ -573,9 +573,11 @@ def cluster_random_drop_percentile(r: np.ndarray, clusters: np.ndarray, kept_mea
         for i in rng.permutation(len(labels)):
             if count >= k:
                 break
-            chosen.append(members[i])
+            chosen.append(rng.permutation(members[i]))
             count += len(members[i])
-        means[d] = r[np.concatenate(chosen)].mean()
+        # Exactly k: the last week drawn is kept only in part, otherwise small filters would be
+        # compared with draws that keep every signal.
+        means[d] = r[np.concatenate(chosen)[:k]].mean()
     return float((means < kept_mean).mean())
 
 
