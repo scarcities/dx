@@ -1699,6 +1699,10 @@ def test_compare_isolates_the_blackout_and_reports_added_signals(portfolio):
         assert rows.loc["v1 (original spec)", col] == pytest.approx(plain_rows.loc["v1 (original spec)", col])
     assert rows.loc["v1 + earnings blackout", "expectancy_r"] != pytest.approx(
         rows.loc["v1 (original spec)", "expectancy_r"])
+    for name in rows.index:                                       # every "v1 + X" row is calendar-free
+        if name.startswith("v1 +") and name != "v1 + earnings blackout":
+            assert rows.loc[name, "expectancy_r"] == pytest.approx(plain_rows.loc[name, "expectancy_r"],
+                                                                   nan_ok=True)
     rules = tables["filters"].set_index("filter")
     assert rules.loc["+DI>-DI signal bar", "pure_filter"]
     anchor = rules.loc["ADX/DI at anchor"]

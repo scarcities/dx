@@ -68,8 +68,9 @@ improvement on that window proves nothing. The honest sequence:
    2023-12-31` (it contains the 2020 crash, the 2022 bear market and 2023). Accept a variant only
    if it is positive there, holds up at `--slippage-bps 5` as well as 2, does not depend on one
    symbol (the `w/o best` column), and a pure filter beats randomly dropping whole weeks of signals
-   (`vs random drop` above ~95%). The anchor check also *adds* signals, so it shows `n/a` there: judge
-   it by its `rule R` and by its held-out folds. The backtest appends every run to
+   (`vs random drop` above ~95%). That test cannot validate a filter that works by dropping a whole
+   symbol (use `w/o best` and the explicit `v1 without SPY, QQQ` row for that). The anchor check also
+   *adds* signals, so it shows `n/a` there: judge it by its `rule R` and by its held-out folds. The backtest appends every run to
    `backtest_ledger.csv` and warns when a window has been used before; commit that file so the
    record follows you to other machines.
 4. If nothing passes, stop iterating on these 5 symbols and 2 years: every further look spends the

@@ -609,8 +609,9 @@ def compare_variants(data: dict[str, pd.DataFrame], start, bt_cfg: BacktestConfi
         excluded = overrides.pop(EXCLUDE, ())
         if excluded and not set(excluded) & set(data):
             continue
-        # The v1 baseline is the original spec: no earnings blackout. Its effect gets its own row.
-        runs.append((name, replace(base, **overrides), None if name.startswith("v1 (") else calendar, excluded))
+        # The v1 rows (baseline and "v1 + one change") run without the earnings blackout, so each
+        # isolates exactly one change; the blackout gets its own row and is included in v2.
+        runs.append((name, replace(base, **overrides), None if name.startswith("v1") else calendar, excluded))
         if name.startswith("v1 (") and calendar:
             runs.append(("v1 + earnings blackout", replace(base, **overrides), calendar, ()))
     if calendar:
@@ -710,8 +711,9 @@ def format_comparison(tables: dict[str, pd.DataFrame], prior_runs: int = 0) -> s
               "  * A filter is only evidence if 'vs random drop' is above ~95% (randomly dropping whole weeks of",
               "    signals rarely does as well) and 'w/o best' stays >= 0 (it is not one stock's rally). Rules that",
               "    also add signals (anchor) cannot be judged that way: compare 'rule R' with v1 and check folds.",
-              "  * 'BE bp' is the per-side cost at which gross expectancy is used up. Blank = no gross edge at all.",
-              "  * The v1 row has no earnings blackout (the original spec); 'v1 + earnings blackout' isolates it.",
+              "  * 'BE bp' is the per-side cost (first-order, about +/-10%) at which gross expectancy is used up.",
+              "    Blank = no gross edge at all.",
+              "  * v1 rows have no earnings blackout (each isolates one change); 'v1 + earnings blackout' isolates it.",
               "  * Fewer than ~30 trades per cell means the CI is wider than any plausible edge.",
               "=" * width]
     return "\n".join(lines)
