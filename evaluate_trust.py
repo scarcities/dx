@@ -241,20 +241,24 @@ def check_replay(df: pd.DataFrame, symbols: list[str], strategy_cfg: StrategyCon
     return [Check("Parity", "Live vs replay signals", status, detail)]
 
 
-def check_performance(df: pd.DataFrame, min_trades: int, backtest_expectancy: Optional[float]) -> list[Check]:
+def check_performance(df: pd.DataFrame, min_trades: int, backtest_expectancy: Optional[float],
+                      min_weeks: int = 20) -> list[Check]:
     exits = _rows(df, J.EXIT_FILL).dropna(subset=["r_multiple"])
     r = exits["r_multiple"].to_numpy(dtype=float)
     pnl = exits["pnl"].dropna()
     if len(r) == 0:
         return [Check("Edge", "Expectancy", INCONCLUSIVE, "no closed trades yet")]
-    lo, hi = bootstrap_ci(r, clusters=week_clusters(exits["ts_utc"]))
+    weeks = week_clusters(exits["ts_utc"])
+    n_weeks = len(np.unique(weeks))
+    lo, hi = bootstrap_ci(r, clusters=weeks)
     gross_loss = -pnl[pnl < 0].sum()
     pf = pnl[pnl > 0].sum() / gross_loss if gross_loss > 0 else float("inf")
     detail = (f"{len(r)} closed trades | win rate {(r > 0).mean():.0%} | expectancy {r.mean():+.3f}R "
-              f"(95% CI {lo:+.3f} .. {hi:+.3f}, weeks resampled) | profit factor {pf:.2f} | P&L ${pnl.sum():,.2f}")
-    if len(r) < min_trades:
+              f"(95% CI {lo:+.3f} .. {hi:+.3f}, week-robust) | profit factor {pf:.2f} | P&L ${pnl.sum():,.2f}")
+    if len(r) < min_trades or n_weeks < min_weeks:
         status = INCONCLUSIVE
-        detail += f" | need >= {min_trades} trades before the CI means anything"
+        detail += (f" | need >= {min_trades} trades over >= {min_weeks} distinct weeks before the CI means "
+                   f"anything (have {len(r)} over {n_weeks})")
     elif lo > 0:
         status = PASS
     elif hi < 0:

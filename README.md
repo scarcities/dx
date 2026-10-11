@@ -26,7 +26,7 @@ it open and plugged in from 09:30 to 16:00 ET.
 | `python backtest.py --from-bars bars.csv.gz --slippage-bps 2` | Same bars at a different cost assumption |
 | `python backtest.py --feed sip --start 2019-01-01 --end 2023-12-31 --compare` | The held-out test (see below) |
 | `python bot.py --once` | One bot cycle, for a smoke test |
-| `python evaluate_trust.py --replay` | After 2 to 3 weeks: the go/no-go report on `paper_trading_journal.csv` |
+| `python evaluate_trust.py --replay` | After 2 to 3 weeks: the go/no-go report on `paper_trading_journal.csv` (it will not judge edge before 30 trades over 20 distinct weeks) |
 | `pytest` | Full offline suite (about a minute); `pytest -m "not slow"` is the quick one |
 
 ## v2: what changed after the first real backtest, and why

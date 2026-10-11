@@ -1705,6 +1705,28 @@ def test_evaluate_trust_on_simulated_three_weeks(live_setup, signals):
     assert "VERDICT" in report
 
 
+def test_week_robust_ci_is_wide_when_there_are_few_weeks():
+    from backtest import bootstrap_ci
+
+    rng = np.random.default_rng(3)
+    r = rng.normal(0.17, 0.98, 30)                       # 30 trades crammed into 3 weeks
+    weeks = np.repeat([1, 2, 3], 10)
+    iid_lo, iid_hi = bootstrap_ci(r)
+    lo, hi = bootstrap_ci(r, clusters=weeks)
+    assert lo <= iid_lo and hi >= iid_hi                 # never narrower than the trade-level CI
+    assert hi - lo > 1.5 * (iid_hi - iid_lo)             # t with 2 df: much wider
+    false_pass = sum(bootstrap_ci(rng.normal(0, 1, 30), clusters=weeks, n=1000, seed=i)[0] > 0 for i in range(200))
+    assert false_pass / 200 <= 0.05
+
+
+def test_evaluate_trust_needs_twenty_weeks_before_judging_edge():
+    rows = [{"event": J.EXIT_FILL, "symbol": "SPY", "r_multiple": 0.8, "pnl": 100.0,
+             "ts_utc": pd.Timestamp("2026-06-01 15:00", tz="UTC") + pd.Timedelta(days=i % 21)} for i in range(40)]
+    df = pd.DataFrame(rows).reindex(columns=COLUMNS)
+    edge = evaluate_trust.check_performance(df, min_trades=30, backtest_expectancy=None)[0]
+    assert edge.status == "INCONCLUSIVE" and "distinct weeks" in edge.detail
+
+
 def test_evaluate_trust_flags_duplicate_orders():
     rows = [{"event": J.ORDER_SUBMITTED, "symbol": "SPY", "client_order_id": "x"},
             {"event": J.ORDER_SUBMITTED, "symbol": "SPY", "client_order_id": "x"}]

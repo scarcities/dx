@@ -5,7 +5,9 @@ Uses the exact strategy, sizing and kill-switch code the live bot uses:
   - entries/exits fill at the open of bar t, only when bar t starts inside 09:45-15:45 ET
     (the live bot acts right after the previous bar closes, inside the same window)
   - bracket stop/target are computed from Close[t-1] and ATR[t-1], like the live order
-  - 0.05% slippage is charged on every fill, entries and exits alike
+  - per-side cost BacktestConfig.slippage_pct (config.SLIPPAGE_PER_SIDE, or --slippage-bps) on
+    entries and on market/stop exits; take-profit limits fill at the limit with no slippage, and
+    only when the high trades through the target by a cent
   - stops and targets that gap are filled at the open; if a bar touches both, the stop wins
 
 "Walk-forward" here means a strictly causal bar-by-bar simulation, reported per
@@ -77,26 +79,46 @@ class BacktestResult:
 
 
 # ----------------------------------------------------------------------------- metrics
+# Two-sided 97.5% Student t quantiles for small degrees of freedom (no scipy dependency).
+_T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+         11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093,
+         20: 2.086, 22: 2.074, 24: 2.064, 26: 2.056, 28: 2.048, 30: 2.042, 40: 2.021, 60: 2.000, 120: 1.980}
+
+
+def t975(df: int) -> float:
+    if df <= 0:
+        return float("inf")
+    keys = sorted(_T975)
+    for k in keys:
+        if df <= k:
+            return _T975[k]
+    return 1.960
+
+
 def bootstrap_ci(values, clusters=None, n: int = 10_000, alpha: float = 0.05, seed: int = 0) -> tuple[float, float]:
-    """Percentile bootstrap CI of the mean. With `clusters` (e.g. ISO week of entry), whole
-    clusters are resampled: trades in the same market pullback are not independent."""
+    """95% CI of the mean R. Always the trade-level percentile bootstrap; with `clusters` (e.g.
+    ISO week of entry) the interval is widened to also cover a cluster-robust t interval with
+    G-1 degrees of freedom. A cluster *percentile* bootstrap is far too narrow when there are
+    only a handful of weeks (it spans roughly the lowest to highest weekly mean)."""
     values = np.asarray(values, dtype=float)
     keep = ~np.isnan(values)
     values = values[keep]
     if len(values) < 2:
         return float("nan"), float("nan")
     rng = np.random.default_rng(seed)
-    if clusters is None:
-        means = rng.choice(values, size=(n, len(values)), replace=True).mean(axis=1)
-    else:
-        labels = pd.Series(np.asarray(clusters)[keep])
-        grouped = pd.Series(values).groupby(labels.to_numpy())
-        sums, counts = grouped.sum().to_numpy(), grouped.count().to_numpy()
-        if len(sums) < 2:
-            return float("nan"), float("nan")
-        idx = rng.integers(0, len(sums), size=(n, len(sums)))
-        means = sums[idx].sum(axis=1) / counts[idx].sum(axis=1)
-    return float(np.quantile(means, alpha / 2)), float(np.quantile(means, 1 - alpha / 2))
+    means = rng.choice(values, size=(n, len(values)), replace=True).mean(axis=1)
+    lo, hi = float(np.quantile(means, alpha / 2)), float(np.quantile(means, 1 - alpha / 2))
+    if clusters is not None:
+        labels = np.asarray(clusters)[keep]
+        mean = values.mean()
+        resid = pd.Series(values - mean).groupby(labels).sum().to_numpy()
+        g = len(resid)
+        if g < 2:
+            return float("-inf"), float("inf")
+        se = math.sqrt(g / (g - 1) * float((resid ** 2).sum())) / len(values)
+        half = t975(g - 1) * se
+        lo, hi = min(lo, mean - half), max(hi, mean + half)
+    return lo, hi
 
 
 def week_clusters(times) -> np.ndarray:
@@ -650,7 +672,7 @@ def compare_variants(data: dict[str, pd.DataFrame], start, bt_cfg: BacktestConfi
 
 def format_comparison(tables: dict[str, pd.DataFrame], prior_runs: int = 0) -> str:
     width = 118
-    lines = ["=" * width, " VARIANT COMPARISON (identical bars and costs; CIs resample whole weeks)", "=" * width]
+    lines = ["=" * width, " VARIANT COMPARISON (identical bars and costs; CIs are robust to same-week clustering)", "=" * width]
     if prior_runs:
         lines += [f" WARNING: this window was already evaluated in {prior_runs} earlier run(s) (see the ledger).",
                   " Every look spends it: it is no longer clean out-of-sample data for choosing a rule.", "-" * width]
