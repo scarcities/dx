@@ -14,7 +14,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --------------------------------------------------------------------------- universe
-SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA"]
+# Universe presets for research (backtest.py --universe). The live bot trades SYMBOLS only;
+# change it only after an expanded universe has passed a held-out --compare.
+UNIVERSES = {
+    "core5": ["SPY", "QQQ", "AAPL", "MSFT", "NVDA"],
+    "expanded12": ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOGL", "AMD", "AVGO", "NFLX", "JPM"],
+}
+SYMBOLS = list(UNIVERSES["core5"])
 
 # Strategy timeframe. Alpaca's native 1Hour bars are clock-aligned (09:00-10:00 mixes
 # pre-market prints into the first bar), so the client builds session-aligned hourly
@@ -32,10 +38,10 @@ ETF_SYMBOLS = frozenset({"SPY", "QQQ", "DIA", "IWM"})
 BACKTEST_LEDGER_PATH = os.getenv("BACKTEST_LEDGER", "backtest_ledger.csv")
 
 # One cost assumption shared by the backtest fills and the strategy's cost floor, so they cannot
-# drift apart. 5 bp per side on market and stop fills (the original brief). Real costs for these
-# mega-caps are probably 1-3 bp; measure them in paper (evaluate_trust.py) and lower this once
-# you have 30+ fills. Lowering it also relaxes the cost floor.
-SLIPPAGE_PER_SIDE = float(os.getenv("SLIPPAGE_PER_SIDE", "0.0005"))
+# drift apart. 2 bp per side on market and stop fills: a realistic market-order cost for these
+# mega-caps, but optimistic for stops in fast markets. Check it against paper fills
+# (evaluate_trust.py) and stress-test with backtest.py --slippage-bps 5.
+SLIPPAGE_PER_SIDE = float(os.getenv("SLIPPAGE_PER_SIDE", "0.0002"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 
 
@@ -68,7 +74,7 @@ class StrategyConfig:
     #               R = 2 ATR and a 1.5R target this is a breakeven stop that can lock at most +0.5R.
     #   "ema_cross" v1: bracket plus an exit on a close below EMA_fast (noise-triggered on 1h bars).
     # Optional time stop for any mode: exit at market after max_hold_bars closed bars in the trade.
-    exit_mode: str = "bracket"
+    exit_mode: str = "ratchet"
     trail_trigger_r: float = 1.0
     trail_atr_mult: float = 2.0
     ratchet_min_step_r: float = 0.10      # ignore stop moves smaller than 0.1R (or $0.02)
@@ -100,6 +106,20 @@ class StrategyConfig:
     anchor_rsi: float = 50.0
     anchor_max_age: int = 30
 
+    # Cross-sectional allocation (v3). When several symbols signal on the same bar and capital or
+    # max_open_positions cannot fund all of them, they are funded in descending order of this
+    # metric on t-1 (symbol name breaks ties): "natr" (ATR/Close), "adx", "rs_ema" (Close/EMA_slow
+    # - 1), or None for SYMBOLS list order (v2). Ranking decides WHO is funded; it does not create
+    # capital. Note: in 2022-2026 "natr" mostly means "NVDA first", the hindsight winner.
+    signal_rank_by: Optional[str] = "natr"
+
+    # Relative-strength filter (v3, OFF by default, hypothesis-grade). Uses the trend spread
+    # Close/EMA_slow - 1 on t-1, so it adds no new parameter:
+    #   "vs_benchmark"  spread >= the benchmark's spread (rs_benchmark, SPY by default)
+    #   "vs_median"     spread >= the median spread of the traded universe on that bar
+    rs_filter: Optional[str] = None
+    rs_benchmark: str = "SPY"
+
     # Earnings (see src/events.py): on the last session before the gap, open positions are closed
     # at this time (checked every heartbeat from the calendar), or at the last decision bar if that
     # session closes early. A failed exit is retried with a 30 s -> 10 min backoff.
@@ -113,7 +133,11 @@ class StrategyConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     risk_per_trade: float = 0.01          # fraction of equity lost if the stop is hit
-    max_position_notional: float = 0.20   # fraction of equity per position
+    max_position_notional: float = 0.33   # fraction of equity per position
+    # Gross long exposure cap as a fraction of equity, applied identically in the backtest and the
+    # live bot. 1.0 = no margin. Without it the live bot would size against Alpaca's margin buying
+    # power (2x-4x equity) while the backtest is limited to cash: 5 x 0.33 = 165% gross.
+    max_gross_exposure: float = 1.0
     max_daily_drawdown: float = 0.03      # vs. previous close equity
     max_open_positions: int = 5
     kill_switch_flatten: bool = True      # flatten everything when the kill-switch trips
@@ -130,6 +154,10 @@ class ExecutionConfig:
     bar_settle_seconds: int = 20          # wait after a bar closes before fetching it
     incomplete_bar_grace_seconds: int = 120
     max_signal_staleness_seconds: int = 600
+    # New entries wait up to this long after a bar closes for every symbol's bar, so ranking and
+    # the RS filter see the whole cross-section (as in the backtest). After that they are ranked
+    # among the symbols that have arrived; exits and stop ratchets never wait.
+    rank_wait_seconds: int = 120
     heartbeat_seconds: int = 30           # kill-switch / fill reconciliation cadence
     fill_poll_timeout_seconds: float = 30.0
     cancel_poll_timeout_seconds: float = 10.0
@@ -149,6 +177,10 @@ class BacktestConfig:
     limit_slippage_pct: float = 0.0
     tp_requires_trade_through: bool = True
     n_folds: int = 4                      # chronological walk-forward segments
+    # Annual yield earned on idle cash (T-bills / sweep), accrued daily. Sharpe and Sortino are
+    # computed on returns in excess of it, so a strategy that sits in cash 75% of the time is
+    # compared with what that cash would have earned anyway. 0 = v2 behaviour.
+    cash_yield: float = 0.0
 
 
 def env_bool(name: str, default: bool = False) -> bool:

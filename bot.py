@@ -4,7 +4,10 @@ Every heartbeat (30s while the market is open) the bot:
   1. checks the 3% daily drawdown kill-switch against Alpaca's previous-close equity
   2. reconciles fills: late entry fills, bracket stop/target exits, unknown positions
   3. after each session-aligned hourly bar closes (10:30, 11:30, ... ET) and only inside
-     09:45-15:45 ET, evaluates every symbol once and journals the decision with its reason
+     09:45-15:45 ET, evaluates every symbol once and journals the decision with its reason:
+     exits and stop ratchets first, then new entries ranked by StrategyConfig.signal_rank_by and
+     funded in that order from min(buying power, equity * max_gross_exposure - open exposure),
+     exactly as the backtester allocates capital
 
 The broker is the source of truth. Order ids are deterministic per (symbol, bar), so a
 restart or a retried request can never double an entry.
@@ -19,7 +22,7 @@ import os
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import pandas as pd
@@ -32,7 +35,8 @@ from src.journal import TradeJournal, slippage_bps
 from src.risk_manager import KillSwitchStatus, RiskManager, client_order_id, r_multiple
 from src.sessions import in_trading_window, latest_bar_end, to_et
 from src.strategy import (EXIT, LONG, R_CALENDAR, R_EARNINGS, R_EXIT, R_TIME, R_TRAIL, WAIT, decide_latest, describe,
-                          ratchet_stop, resolve_state, stop_too_close, trailing_exit_armed)
+                          rank_candidates, rank_metric, ratchet_stop, relative_strength_ok, resolve_state,
+                          stop_too_close, trailing_exit_armed, trend_spread)
 
 STRATEGY_TAG = "tpb2"  # v2 rules; keeps client_order_ids and journals apart from v1
 EXIT_LABELS = {R_EXIT: "EMA_EXIT", R_EARNINGS: "EARNINGS_EXIT", R_TRAIL: "TRAIL_STOP", R_TIME: "TIME_EXIT"}
@@ -61,6 +65,20 @@ def _float(value) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return out if out == out else None
+
+
+@dataclass
+class Decision:
+    """One symbol's decision for the bar that just closed, before it is journaled and acted on."""
+    symbol: str
+    sig: pd.Series
+    decision_bar: pd.Timestamp
+    in_position: bool
+    state: str
+    reason_code: str
+    detail: str
+    new_stop: Optional[float] = None
+    notes: list = field(default_factory=list)
 
 
 @dataclass
@@ -179,30 +197,53 @@ class TradingBot:
         stale = (now - due).total_seconds() > self.ecfg.max_signal_staleness_seconds
 
         start = now - pd.Timedelta(days=self.ecfg.live_lookback_days)
-        bars = self.client.fetch_session_bars(self.symbols, start.to_pydatetime(), now.to_pydatetime(), now=now)
+        wanted = list(self.symbols)
+        if self.scfg.rs_filter == "vs_benchmark" and self.scfg.rs_benchmark not in wanted:
+            wanted.append(self.scfg.rs_benchmark)          # compared with, never traded
+        bars = self.client.fetch_session_bars(wanted, start.to_pydatetime(), now.to_pydatetime(), now=now)
         positions = self.client.get_positions()
         self._reconcile(positions, now, status)  # a bracket leg may have filled since the first check
         open_order_symbols = {o.symbol for o in self.client.get_open_orders(self.symbols)}
-        done = [self._evaluate_symbol(symbol, bars.get(symbol), due, now, positions, open_order_symbols,
-                                      account, status, stale) for symbol in self.symbols]
-        if all(done) or stale:
+        ready = {s: self._bar_ready(bars.get(s), due) for s in wanted}
+        # Entries wait for the whole cross-section (or rank_wait_seconds), so ranking and the RS
+        # filter see the same candidates as the backtest. Exits and ratchets never wait.
+        complete = all(ready.values()) or stale or (now - due).total_seconds() >= self.ecfg.rank_wait_seconds
+
+        done, candidates = {}, {}
+        for symbol in self.symbols:
+            frame = bars.get(symbol)
+            if not ready[symbol]:
+                if stale:
+                    self.journal.log(J.ERROR, now=now, symbol=symbol, message=f"No closed bar ending {due} received")
+                done[symbol] = stale
+                continue
+            if self.last_decision_bar.get(symbol) == frame["bar_end"].iloc[-1]:
+                done[symbol] = True
+                continue
+            decision = self._decide(symbol, frame, now, positions)
+            if decision.state == LONG and not stale:
+                if complete:
+                    candidates[symbol] = decision
+                done[symbol] = complete
+                continue
+            self._act(decision, now, positions, open_order_symbols, status, stale)
+            done[symbol] = True
+        if candidates:
+            sigs = {s: decide_latest(bars[s], self.scfg) for s in wanted if ready[s]}
+            self._allocate(candidates, sigs, now, open_order_symbols, status)
+        if all(done.values()) or stale:
             self.last_processed_end = due
-        return "EVALUATED" if all(done) else "WAITING_FOR_BARS"
+        return "EVALUATED" if all(done.values()) else "WAITING_FOR_BARS"
+
+    @staticmethod
+    def _bar_ready(bars: Optional[pd.DataFrame], due: pd.Timestamp) -> bool:
+        return bars is not None and not bars.empty and bars["bar_end"].iloc[-1] >= due
 
     # ------------------------------------------------------------------ per symbol
-    def _evaluate_symbol(self, symbol: str, bars: Optional[pd.DataFrame], due: pd.Timestamp, now: pd.Timestamp,
-                         positions: dict, open_order_symbols: set, account, ks: KillSwitchStatus,
-                         stale: bool) -> bool:
-        """Returns False when the bar that just closed is not available yet (retry next heartbeat)."""
-        if bars is None or bars.empty or bars["bar_end"].iloc[-1] < due:
-            if stale:
-                self.journal.log(J.ERROR, now=now, symbol=symbol, message=f"No closed bar ending {due} received")
-                return True
-            return False
+    def _decide(self, symbol: str, bars: pd.DataFrame, now: pd.Timestamp, positions: dict) -> Decision:
+        """Everything that depends on this symbol alone: signal, earnings window, time stop and
+        stop ratchet. Cross-sectional checks (RS filter, ranking, capital) happen in _allocate."""
         decision_bar = bars["bar_end"].iloc[-1]
-        if self.last_decision_bar.get(symbol) == decision_bar:
-            return True
-
         sig = decide_latest(bars, self.scfg)
         in_position = symbol in positions
         armed = self._exit_armed(symbol, bars)
@@ -235,26 +276,73 @@ class TradingBot:
                     new_stop = None
                 elif new_stop is not None:
                     detail += f"; stop {trade.stop_price:.2f} -> {new_stop:.2f}"
+        return Decision(symbol, sig, decision_bar, in_position, state, reason_code, detail, new_stop)
+
+    def _allocate(self, candidates: dict[str, Decision], sigs: dict[str, pd.Series], now: pd.Timestamp,
+                  open_order_symbols: set, ks: KillSwitchStatus) -> None:
+        """Second pass, after every exit of this bar: RS filter, then rank the entry candidates and
+        fund them in order from min(buying power, equity * max_gross_exposure - open exposure).
+        Positions and buying power are re-read, so capital freed by this bar's exits is usable
+        (the backtest fills those exits at the open before sizing entries)."""
+        spreads = {s: trend_spread(float(sig["close"]), float(sig["ema_slow"])) for s, sig in sigs.items()}
+        passed = {}
+        for symbol, decision in candidates.items():
+            ok, code, why = relative_strength_ok(symbol, spreads, self.scfg, self.symbols)
+            if ok:
+                passed[symbol] = decision
+            else:
+                decision.state, decision.reason_code = WAIT, code
+                decision.detail = f"{why} | {decision.detail}"
+                self._act(decision, now, {}, open_order_symbols, ks, False)
+        if not passed:
+            return
+        metrics = {s: rank_metric({k: d.sig.get(k) for k in ("natr", "adx", "close", "ema_slow")}, self.scfg)
+                   for s, d in passed.items()}
+        ranked = rank_candidates(list(passed), metrics, self.symbols, self.scfg)
+        positions = self.client.get_positions()
+        account = self.client.get_account()
+        gross = sum(abs(_float(getattr(p, "market_value", None)) or float(p.qty) * float(p.avg_entry_price))
+                    for p in positions.values())
+        gross += sum(p.get("notional", 0.0) for s, p in self.pending.items() if s not in positions)
+        buying_power = _float(account.buying_power)
+        capital = ks.equity * self.rcfg.max_gross_exposure - gross
+        if buying_power is not None:
+            capital = min(capital, buying_power)
+        held = set(positions) | set(self.pending)
+        for i, symbol in enumerate(ranked, start=1):
+            decision = passed[symbol]
+            by = self.scfg.signal_rank_by
+            decision.notes.append(f"rank {i}/{len(ranked)}" + (f" by {by} {metrics[symbol]:.4g}" if by else
+                                                                " (symbol list order)")
+                                  + f", capital left ${max(capital, 0.0):,.0f}")
+            size = self._act(decision, now, held, open_order_symbols, ks, False, capital=max(capital, 0.0))
+            if size is not None and size.shares >= 1:
+                held.add(symbol)
+                capital -= size.notional
+
+    def _act(self, d: Decision, now: pd.Timestamp, positions, open_order_symbols: set, ks: KillSwitchStatus,
+             stale: bool, capital: Optional[float] = None):
+        """Journal one decision and carry it out. Returns the entry size when one was computed."""
+        symbol, state, sig = d.symbol, d.state, d.sig
         account_fields = {"equity": ks.equity, "day_start_equity": ks.day_start_equity,
                           "daily_pnl_pct": ks.daily_pnl_pct}
-
-        action, size, cid = ("HOLD" if in_position else "NONE"), None, ""
+        detail = " | ".join(d.notes + [d.detail])
+        action, size, cid = ("HOLD" if d.in_position else "NONE"), None, ""
         if stale and state == LONG:          # exits and stop ratchets reduce risk, so they still run
             action = "SKIPPED_STALE"
         elif state == LONG:
-            cid = client_order_id(STRATEGY_TAG, symbol, decision_bar)
+            cid = client_order_id(STRATEGY_TAG, symbol, d.decision_bar)
             block = self.risk.entry_block_reason(symbol, to_et(now).date(), set(positions) | set(self.pending),
                                                  open_order_symbols | set(self.exit_pending), self.submitted_ids, cid)
             if block is None:
-                size = self.risk.size_position(ks.equity, float(sig["close"]), float(sig["atr"]),
-                                               buying_power=_float(account.buying_power))
+                size = self.risk.size_position(ks.equity, float(sig["close"]), float(sig["atr"]), buying_power=capital)
                 block = "SIZE_ZERO" if size.shares < 1 else None
             action = f"BLOCKED_{block}" if block else ("DRY_RUN_ENTER" if self.dry_run else "ENTER")
         elif state == EXIT and symbol in self.exit_pending:
             action = "EXIT_PENDING"          # already being worked by the heartbeat retry loop
         elif state == EXIT:
             action = "DRY_RUN_EXIT" if self.dry_run else "EXIT"
-        elif new_stop is not None:
+        elif d.new_stop is not None:
             action = "DRY_RUN_RATCHET_STOP" if self.dry_run else "RATCHET_STOP"
 
         sizing = {}
@@ -262,20 +350,20 @@ class TradingBot:
             sizing = {"qty": size.shares, "ref_price": size.entry_ref, "stop_price": size.stop_price,
                       "take_profit": size.take_profit, "risk_pct": size.risk_pct,
                       "notional_pct": size.notional_pct, "binding_constraint": size.binding_constraint}
-        self.journal.log_bar_check(symbol, sig, decision_bar, state, reason_code, detail, action, in_position,
+        self.journal.log_bar_check(symbol, sig, d.decision_bar, state, d.reason_code, detail, action, d.in_position,
                                    now=now, client_order_id=cid, **sizing, **account_fields)
-        self.last_decision_bar[symbol] = decision_bar
-        log.info("%s %s %s (%s) -> %s | %s", symbol, decision_bar.strftime("%m-%d %H:%M"), state, reason_code,
+        self.last_decision_bar[symbol] = d.decision_bar
+        log.info("%s %s %s (%s) -> %s | %s", symbol, d.decision_bar.strftime("%m-%d %H:%M"), state, d.reason_code,
                  action, detail)
 
         if action == "ENTER":
             self._submit_entry(symbol, sig, size, cid, now, ks)
         elif action == "EXIT":
-            self._submit_exit(symbol, float(sig["close"]), now, ks, EXIT_LABELS.get(reason_code, "MARKET_EXIT"))
+            self._submit_exit(symbol, float(sig["close"]), now, ks, EXIT_LABELS.get(d.reason_code, "MARKET_EXIT"))
         elif action == "RATCHET_STOP":
-            self.desired_stop[symbol] = {"stop": new_stop, "attempts": 0}
+            self.desired_stop[symbol] = {"stop": d.new_stop, "attempts": 0}
             self._try_ratchet(symbol, now)
-        return True
+        return size if action in ("ENTER", "DRY_RUN_ENTER") else None
 
     def _session_days(self, now: pd.Timestamp):
         """Exchange sessions around today from the broker calendar, refreshed once a day. On
@@ -373,7 +461,7 @@ class TradingBot:
         latency_ms = (time.monotonic() - started) * 1000
         pending = {"cid": cid, "ref_price": size.entry_ref, "stop": size.stop_price, "target": size.take_profit,
                    "ref_bar": sig["ref_bar_time"], "planned_risk": size.entry_ref - size.stop_price,
-                   "submitted": now}
+                   "submitted": now, "notional": size.notional}
         if _status(order) == FILLED:
             self._record_entry_fill(symbol, order, pending, now, ks.equity, latency_ms)
         elif _status(order) in DEAD_ORDER:

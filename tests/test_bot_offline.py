@@ -9,9 +9,13 @@ The regimes are deliberately unambiguous: they test the filter logic, not market
 """
 from __future__ import annotations
 
+import ast
+import dataclasses
 import datetime as dt
+import inspect
 import json
 import math
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -21,7 +25,7 @@ import pytest
 
 import backtest
 import evaluate_trust
-from backtest import Backtester, format_tear_sheet, load_bars, save_bars
+from backtest import format_tear_sheet, load_bars, save_bars
 from bot import TradingBot
 from config import BacktestConfig, ExecutionConfig, RiskConfig, StrategyConfig
 from src import journal as J
@@ -31,16 +35,42 @@ from src.indicators import add_indicators
 from src.journal import COLUMNS, TradeJournal, read_journal, slippage_bps
 from src.risk_manager import RiskManager, client_order_id, r_multiple
 from src.sessions import ET, complete_bars, in_trading_window, latest_bar_end, to_session_bars
-from src.strategy import (EXIT, LONG, R_CHOP, R_COST, R_DEAD, R_DI, R_EARNINGS, R_ENTRY, R_SPIKE, WAIT,
-                          decide_latest, describe, evaluate_closed_bars, generate_signals, ratchet_stop, resolve_state)
+from src.strategy import (EXIT, LONG, R_CHOP, R_COST, R_DEAD, R_DI, R_EARNINGS, R_ENTRY, R_RS, R_RS_NO_BENCHMARK,
+                          R_SPIKE, WAIT, decide_latest, describe, evaluate_closed_bars, generate_signals, rank_candidates,
+                          rank_metric, ratchet_stop, relative_strength_ok, resolve_state)
 
-CFG = StrategyConfig()                                                    # v2 defaults
-V1 = replace(CFG, exit_mode="ema_cross", max_cost_r=None, directional_check=None)  # the original spec
-TRAIL = replace(CFG, exit_mode="ratchet", max_cost_r=None, directional_check=None)  # v1 entries, ratchet
-LIVE_RISK = RiskConfig(earnings_fail_closed=False)   # synthetic symbols have no earnings calendar
+# Every policy setting a test depends on is pinned here, never taken from config.py defaults, so
+# changing a default (exit_mode, notional cap, ranking, slippage ...) cannot break ./start_mac.sh.
+# test_tests_never_use_bare_config_defaults enforces this.
+CFG = StrategyConfig(                                                     # the v2 rules
+    ema_fast=50, ema_slow=200, rsi_period=14, adx_period=14, atr_period=14, adx_min=20.0, natr_window=100,
+    natr_low_pct=0.15, natr_high_pct=0.92, rsi_trigger=42.0, rsi_dip_lookback=3, stop_atr_mult=2.0,
+    target_atr_mult=3.0, exit_mode="bracket", trail_trigger_r=1.0, trail_atr_mult=2.0, ratchet_min_step_r=0.10,
+    stop_buffer_pct=0.002, max_hold_bars=None, ema_exit_requires_arming=True, round_trip_cost=0.001,
+    max_cost_r=None, directional_check=None, anchor_rsi=50.0, anchor_max_age=30, signal_rank_by=None,
+    rs_filter=None, rs_benchmark="SPY", earnings_exit_time="14:30", warmup_bars=400)
+V1 = replace(CFG, exit_mode="ema_cross")                                  # the original spec
+TRAIL = replace(CFG, exit_mode="ratchet")                                 # v1 entries, ratchet
+RANKED = replace(TRAIL, signal_rank_by="natr")                            # the v3 rules
+RISK = RiskConfig(risk_per_trade=0.01, max_position_notional=0.20, max_gross_exposure=1.0, max_daily_drawdown=0.03,
+                  max_open_positions=5, kill_switch_flatten=True, earnings_fail_closed=True)
+LIVE_RISK = replace(RISK, earnings_fail_closed=False)   # synthetic symbols have no earnings calendar
+BT = BacktestConfig(years=2.0, warmup_days=120, initial_equity=100_000.0, slippage_pct=0.0005,
+                    limit_slippage_pct=0.0, tp_requires_trade_through=True, n_folds=4, cash_yield=0.0)
+EXEC = ExecutionConfig(trade_window_start="09:45", trade_window_end="15:45", data_feed="iex", live_lookback_days=180,
+                       bar_settle_seconds=20, incomplete_bar_grace_seconds=120, max_signal_staleness_seconds=600,
+                       rank_wait_seconds=120, heartbeat_seconds=30, fill_poll_timeout_seconds=30.0,
+                       cancel_poll_timeout_seconds=10.0, max_retries=5, backoff_base_seconds=1.0,
+                       backoff_max_seconds=30.0)
 OHLC = ["open", "high", "low", "close"]
 REGIMES = [("BULL", 800), ("CHOP", 400), ("CRASH", 300), ("DEAD", 500)]
 SEEDS = [7, 1, 2, 3]
+
+
+def Backtester(strategy_cfg: StrategyConfig = CFG, risk_cfg: RiskConfig = RISK, bt_cfg: BacktestConfig = BT,
+               exec_cfg: ExecutionConfig = EXEC, calendar=None) -> backtest.Backtester:
+    """backtest.Backtester with the pinned test configs instead of config.py defaults."""
+    return backtest.Backtester(strategy_cfg, risk_cfg, bt_cfg, exec_cfg, calendar)
 
 
 # ============================================================================ synthetic data
@@ -363,7 +393,7 @@ def test_resolve_state_and_reason_text(signals):
 
 # ============================================================================ risk manager
 def test_sizing_risks_exactly_one_percent():
-    rm = RiskManager(RiskConfig(), StrategyConfig())
+    rm = RiskManager(RISK, CFG)
     size = rm.size_position(equity=100_000, entry_ref=50.0, atr=2.5)
     assert size.shares == 200                       # 1,000 / (2.0 * 2.5)
     assert size.stop_price == 45.0 and size.take_profit == 57.5
@@ -374,7 +404,7 @@ def test_sizing_risks_exactly_one_percent():
 
 
 def test_sizing_never_exceeds_one_percent():
-    rm = RiskManager(RiskConfig(), StrategyConfig())
+    rm = RiskManager(RISK, CFG)
     rng = np.random.default_rng(0)
     for _ in range(2_000):
         equity, price = rng.uniform(5_000, 1_000_000), rng.uniform(5, 1_500)
@@ -387,7 +417,7 @@ def test_sizing_never_exceeds_one_percent():
 
 
 def test_notional_cap_binds_on_tight_hourly_stops():
-    rm = RiskManager(RiskConfig(), StrategyConfig())
+    rm = RiskManager(RISK, CFG)
     size = rm.size_position(equity=100_000, entry_ref=500.0, atr=1.0)  # 1% risk would need 500 shares
     assert size.shares == 40 and size.binding_constraint == "NOTIONAL_CAP"
     assert size.notional_pct == pytest.approx(0.20)
@@ -395,14 +425,14 @@ def test_notional_cap_binds_on_tight_hourly_stops():
 
 
 def test_buying_power_and_zero_size():
-    rm = RiskManager(RiskConfig(), StrategyConfig())
+    rm = RiskManager(RISK, CFG)
     assert rm.size_position(100_000, 50.0, 2.5, buying_power=4_000).shares == 80
     assert rm.size_position(1_000, 50.0, 100.0).shares == 0
     assert rm.size_position(100_000, 50.0, float("nan")).shares == 0
 
 
 def test_kill_switch_trips_at_three_percent_and_latches():
-    rm = RiskManager(RiskConfig(), StrategyConfig())
+    rm = RiskManager(RISK, CFG)
     day = dt.date(2026, 10, 12)
     assert not rm.check_daily_drawdown(day, 100_000, 98_000).tripped
     assert not rm.check_daily_drawdown(day, 100_000, 97_000.01).tripped
@@ -418,7 +448,7 @@ def test_kill_switch_trips_at_three_percent_and_latches():
 
 def test_kill_switch_on_simulated_consecutive_full_losses():
     """Four 1R losers in a day: the switch must stay off after three and trip on the fourth."""
-    rm = RiskManager(RiskConfig(), StrategyConfig())
+    rm = RiskManager(RISK, CFG)
     day, start = dt.date(2026, 10, 12), 100_000.0
     equity, tripped_after = start, None
     for n in range(1, 6):
@@ -430,7 +460,7 @@ def test_kill_switch_on_simulated_consecutive_full_losses():
 
 
 def test_idempotency_gates():
-    rm = RiskManager(RiskConfig(max_open_positions=2), StrategyConfig())
+    rm = RiskManager(replace(RISK, max_open_positions=2), CFG)
     day = dt.date(2026, 10, 12)
     cid = client_order_id("tpb1", "SPY", pd.Timestamp("2026-10-12 10:30", tz=ET.zone))
     assert cid == "tpb1-SPY-20261012T1030"
@@ -672,7 +702,7 @@ def test_backtester_end_to_end_tear_sheet(backtest_results, capsys):
         assert "sortino" in m and m["max_drawdown"] <= 0
         for label in ("Sharpe", "Sortino", "Profit factor", "Max drawdown", "Expectancy", "Walk-forward folds"):
             assert label in sheet
-        assert len(result.folds) == BacktestConfig().n_folds
+        assert len(result.folds) == BT.n_folds
         assert result.equity.notna().all()
     assert np.isfinite(backtest_results["v1"].metrics["sortino"])
     assert set(backtest_results["v1"].trades["exit_reason"]) >= {"STOP_LOSS", "TAKE_PROFIT", "EMA_EXIT"}
@@ -719,7 +749,7 @@ def test_cluster_random_drop_null_keeps_exactly_k_signals():
 
 def test_take_profit_needs_a_trade_through(portfolio):
     df = portfolio["SYN7"][OHLC]
-    touch = Backtester(strategy_cfg=V1, bt_cfg=BacktestConfig(tp_requires_trade_through=False)).run({"S": df})
+    touch = Backtester(strategy_cfg=V1, bt_cfg=replace(BT, tp_requires_trade_through=False)).run({"S": df})
     through = Backtester(strategy_cfg=V1).run({"S": df})
     for result in (touch, through):
         tp = result.trades[result.trades["exit_reason"] == "TAKE_PROFIT"]
@@ -770,7 +800,7 @@ def test_backtester_trades_follow_the_rules(backtest_results, portfolio, name):
 
 
 def test_backtester_kill_switch_flattens_and_halts(portfolio):
-    tight = RiskConfig(max_daily_drawdown=0.001)
+    tight = replace(RISK, max_daily_drawdown=0.001)
     result = Backtester(risk_cfg=tight).run({s: df[OHLC] for s, df in portfolio.items()})
     assert result.metrics["kill_switch_events"] > 0
     trades = result.trades
@@ -801,6 +831,7 @@ class FakeBroker:
         self.protective, self.fail_protect, self.fail_close = [], False, 0
         self.fail_fetch = False
         self.fail_flatten, self.slow_close, self.hide_fills = False, False, False
+        self.late: set = set()             # symbols whose newest bar has not arrived yet
         self._n = 0
 
     def _order(self, **kw):
@@ -849,6 +880,8 @@ class FakeBroker:
 
     def get_positions(self):
         self._work_brackets()
+        for symbol, pos in self.positions.items():              # Alpaca reports market value as a string
+            pos.market_value = str(float(pos.qty) * self._last_close(symbol))
         return dict(self.positions)
 
     def get_open_orders(self, symbols=None):
@@ -857,7 +890,8 @@ class FakeBroker:
     def fetch_session_bars(self, symbols, start, end, now=None):
         if self.fail_fetch:
             raise ConnectionError("market data unavailable (simulated)")
-        return {s: complete_bars(self.bars[s], now) for s in symbols}
+        out = {s: complete_bars(self.bars[s], now) for s in symbols if s in self.bars}
+        return {s: df.iloc[:-1] if s in self.late else df for s, df in out.items()}
 
     def submit_bracket_order(self, symbol, qty, stop_price, take_profit, client_order_id):
         existing = [o for o in self.orders.values() if o.client_order_id == client_order_id]
@@ -964,7 +998,7 @@ def live_setup(tmp_path, synthetic, signals):
 
 
 def _make_bot(broker, journal, symbols=("SYN",), cfg=CFG, risk=LIVE_RISK, **kw):
-    return TradingBot(broker, journal, list(symbols), cfg, risk, ExecutionConfig(),
+    return TradingBot(broker, journal, list(symbols), cfg, risk, EXEC,
                       now_fn=lambda: broker.now, sleep=lambda s: None, **kw)
 
 
@@ -982,7 +1016,7 @@ def test_bot_enters_once_with_exact_bracket_and_survives_restart(live_setup, sig
     assert _step(bot, broker, when) == "EVALUATED"
 
     sig = signals.iloc[t]
-    expected = RiskManager(RiskConfig(), CFG).size_position(100_000.0, sig["close"], sig["atr"],
+    expected = RiskManager(RISK, CFG).size_position(100_000.0, sig["close"], sig["atr"],
                                                             buying_power=400_000.0)
     assert len(broker.submitted) == 1
     order = broker.submitted[0]
@@ -1224,12 +1258,12 @@ def test_earnings_exit_on_a_half_day_uses_the_last_decision_bar(portfolio, tmp_p
 
 def test_bot_fails_closed_without_upcoming_earnings_date(live_setup, signals):
     bars, broker, journal, t = live_setup
-    bot = _make_bot(broker, journal, risk=RiskConfig())                              # fail closed (default)
+    bot = _make_bot(broker, journal, risk=RISK)                                      # fail closed
     _step(bot, broker, signals.index[t] + pd.Timedelta(seconds=25))
     row = read_journal(journal.path).query("event == @J.BAR_CHECK").iloc[-1]
     assert row["reason_code"] == "EARNINGS_CALENDAR_STALE" and broker.submitted == []
     later = (signals.index[t] + pd.Timedelta(days=40)).date()
-    ok = _make_bot(broker, journal, risk=RiskConfig(), calendar={"SYN": [(later, "AMC")]})
+    ok = _make_bot(broker, journal, risk=RISK, calendar={"SYN": [(later, "AMC")]})
     _step(ok, broker, signals.index[t] + pd.Timedelta(seconds=30))
     assert len(broker.submitted) == 1
 
@@ -1482,7 +1516,7 @@ def test_duplicate_client_order_id_returns_existing_order():
         def get_order_by_client_id(self, cid):
             return existing
 
-    client = AlpacaClient("k", "s", True, ExecutionConfig(), trading=Trading(), data=object(), sleep=lambda s: None)
+    client = AlpacaClient("k", "s", True, EXEC, trading=Trading(), data=object(), sleep=lambda s: None)
     assert client.submit_bracket_order("SPY", 1, 99.0, 103.0, existing.client_order_id) is existing
 
 
@@ -1500,7 +1534,7 @@ def test_fetch_session_bars_from_alpaca_barset():
             assert request.feed.value == "iex" and request.adjustment.value == "all"
             return BarSet(raw)
 
-    client = AlpacaClient("k", "s", True, ExecutionConfig(data_feed="iex"), trading=object(), data=Data())
+    client = AlpacaClient("k", "s", True, EXEC, trading=object(), data=Data())
     now = pd.Timestamp("2026-07-15 12:31", tz=ET.zone)
     bars = client.fetch_session_bars(["SPY", "QQQ"], now - pd.Timedelta(days=1), now, now=now)
     assert [f"{t:%H:%M}" for t in bars["SPY"].index] == ["09:30", "10:30", "11:30"]
@@ -1525,7 +1559,7 @@ def test_close_position_never_sells_into_pending_leg_cancels():
         def close_position(self, symbol):
             Trading.sold = True
 
-    exec_cfg = ExecutionConfig(cancel_poll_timeout_seconds=0.0)
+    exec_cfg = replace(EXEC, cancel_poll_timeout_seconds=0.0)
     client = AlpacaClient("k", "s", True, exec_cfg, trading=Trading(), data=object(), sleep=lambda s: None)
     with pytest.raises(ExitBlocked):
         client.close_position("SPY")
@@ -1546,7 +1580,7 @@ def test_replace_stop_is_single_shot_and_needs_exactly_one_leg():
             calls.append((order_id, request.stop_price))
             raise _api_error(503)
 
-    client = AlpacaClient("k", "s", True, ExecutionConfig(), trading=Trading(), data=object(), sleep=lambda s: None)
+    client = AlpacaClient("k", "s", True, EXEC, trading=Trading(), data=object(), sleep=lambda s: None)
     with pytest.raises(Exception):
         client.replace_stop("SPY", 101.234)
     assert calls == [("a", 101.23)], "a non-idempotent replace must not be retried"
@@ -1577,7 +1611,7 @@ def test_restore_protection_places_oco_then_falls_back_to_a_plain_stop():
             submitted.append(fields)
             return SimpleNamespace(id="new")
 
-    client = AlpacaClient("k", "s", True, ExecutionConfig(cancel_poll_timeout_seconds=0.0), trading=Trading(),
+    client = AlpacaClient("k", "s", True, replace(EXEC, cancel_poll_timeout_seconds=0.0), trading=Trading(),
                           data=object(), sleep=lambda s: None)
     open_orders.append(SimpleNamespace(id="orphan-tp", symbol="AAPL", side="sell", status="new", order_type="limit",
                                        type="limit"))
@@ -1596,7 +1630,7 @@ def test_restore_protection_places_oco_then_falls_back_to_a_plain_stop():
 
     open_orders.append(SimpleNamespace(id="leg", symbol="AAPL", side="sell", status="held", order_type="limit",
                                        type="limit"))
-    stuck = AlpacaClient("k", "s", True, ExecutionConfig(cancel_poll_timeout_seconds=0.0), trading=Stuck(),
+    stuck = AlpacaClient("k", "s", True, replace(EXEC, cancel_poll_timeout_seconds=0.0), trading=Stuck(),
                          data=object(), sleep=lambda s: None)
     with pytest.raises(ExitBlocked):
         stuck.restore_protection("AAPL", 10, 195.12, 210.0)
@@ -1619,7 +1653,7 @@ def test_restore_protection_counts_a_lost_response_as_success():
                                                order_type="stop", type="stop", stop_price=195.12, limit_price=None))
             raise ConnectionError("reset by peer")
 
-    client = AlpacaClient("k", "s", True, ExecutionConfig(cancel_poll_timeout_seconds=0.0), trading=Trading(),
+    client = AlpacaClient("k", "s", True, replace(EXEC, cancel_poll_timeout_seconds=0.0), trading=Trading(),
                           data=object(), sleep=lambda s: None)
     assert client.restore_protection("AAPL", 10, 195.12, 210.0) == "oco"
     assert len(open_orders) == 1                             # no blind retry, no duplicate
@@ -1634,7 +1668,7 @@ def test_get_sessions_reads_the_exchange_calendar():
             return [SimpleNamespace(date=dt.date(2026, 7, 2), close=dt.datetime(2026, 7, 2, 13, 0)),
                     SimpleNamespace(date=dt.date(2026, 7, 6), close=dt.datetime(2026, 7, 6, 16, 0))]
 
-    client = AlpacaClient("k", "s", True, ExecutionConfig(), trading=Trading(), data=object())
+    client = AlpacaClient("k", "s", True, EXEC, trading=Trading(), data=object())
     assert client.get_sessions(dt.date(2026, 7, 1), dt.date(2026, 7, 7)) == [dt.date(2026, 7, 2), dt.date(2026, 7, 6)]
     assert client.get_session_closes(dt.date(2026, 7, 1), dt.date(2026, 7, 7)) == {
         dt.date(2026, 7, 2): "13:00", dt.date(2026, 7, 6): "16:00"}
@@ -1678,7 +1712,7 @@ def test_backtest_cli_compare_and_ledger_warning(tmp_path, portfolio, capsys):
             "--ledger", str(tmp_path / "ledger.csv"), "--earnings", str(tmp_path / "x")]
     assert backtest.main(args) == 0
     first = capsys.readouterr().out
-    for section in ("VARIANT COMPARISON", "v1 (original spec)", "v2 (defaults)", "Paired exit study",
+    for section in ("VARIANT COMPARISON", "v1 (original spec)", backtest.DEFAULTS_ROW, "Paired exit study",
                     "ema_cross (v1)", "Entry rules", "vs random drop", "added"):
         assert section in first
     assert "already evaluated" not in first
@@ -1691,10 +1725,10 @@ def test_compare_isolates_the_blackout_and_reports_added_signals(portfolio):
     cal = {"SYN4": [(dt.date(2023, 4, 21), "AMC")]}       # v1 holds SYN4 from 04-19 to 04-24
     v1 = Backtester(strategy_cfg=V1, calendar=cal).run({"SYN4": data["SYN4"]}).trades
     assert (v1["exit_reason"] == "EARNINGS_EXIT").any(), "the event must cut a v1 trade for this test to bite"
-    tables = backtest.compare_variants(data, None, BacktestConfig(), ExecutionConfig(), cal)
-    plain = backtest.compare_variants(data, None, BacktestConfig(), ExecutionConfig(), None)
+    tables = backtest.compare_variants(data, None, BT, EXEC, cal, RANKED, RISK)
+    plain = backtest.compare_variants(data, None, BT, EXEC, None, RANKED, RISK)
     rows, plain_rows = tables["portfolio"].set_index("variant"), plain["portfolio"].set_index("variant")
-    assert "v1 + earnings blackout" in rows.index and "v2 without earnings blackout" in rows.index
+    assert "v1 + earnings blackout" in rows.index and "v3 without earnings blackout" in rows.index
     for col in ("trades", "expectancy_r"):                        # the v1 baseline ignores the calendar
         assert rows.loc["v1 (original spec)", col] == pytest.approx(plain_rows.loc["v1 (original spec)", col])
     assert rows.loc["v1 + earnings blackout", "expectancy_r"] != pytest.approx(
@@ -1716,7 +1750,7 @@ def test_slippage_flag_moves_the_strategy_cost_too(tmp_path, portfolio, monkeypa
     seen = []
 
     class Spy(backtest.Backtester):
-        def __init__(self, strategy_cfg=StrategyConfig(), *a, **kw):
+        def __init__(self, strategy_cfg, *a, **kw):
             seen.append((strategy_cfg.round_trip_cost, a[1].slippage_pct if len(a) > 1 else None))
             super().__init__(strategy_cfg, *a, **kw)
 
@@ -1738,7 +1772,7 @@ def test_evaluate_trust_on_simulated_three_weeks(live_setup, signals):
     for when in _decision_times(bars, t - 1, t - 1 + 15 * 7):           # 15 trading days
         _step(bot, broker, when)
     df = read_journal(journal.path)
-    checks, verdict = evaluate_trust.evaluate(df, ["SYN"])
+    checks, verdict = evaluate_trust.evaluate(df, ["SYN"], LIVE_RISK, 5.0, strategy_cfg=CFG)
     status = {c.name: c.status for c in checks}
     assert status["Bar-check coverage"] == "PASS"
     assert status["Decision latency after bar close"] == "PASS"
@@ -1787,3 +1821,253 @@ def test_gitignore_protects_secrets_and_outputs():
     lines = open(".gitignore").read().split()
     for pattern in (".env", "*.log", "*.csv", ".venv/", "__pycache__/"):
         assert pattern in lines
+
+
+# ============================================================================ v3: ranking, RS, capital
+def test_tests_never_use_bare_config_defaults():
+    """Configs are built only in the pinned constants at the top of this file (and changed with
+    replace()), so a new default in config.py cannot change what a test checks. The CLI tests
+    are the exception by design: they assert only things that hold for any defaults."""
+    tree = ast.parse(inspect.getsource(sys.modules[__name__]))
+    pinned = {"CFG", "RISK", "BT", "EXEC"}
+    allowed = {id(node.value) for node in tree.body if isinstance(node, ast.Assign)
+               and {getattr(t, "id", None) for t in node.targets} <= pinned}
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if name in {"StrategyConfig", "RiskConfig", "BacktestConfig", "ExecutionConfig"} and id(node) not in allowed:
+            offenders.append(f"line {node.lineno}: {name}(...)")
+        needs = {"TradingBot": 6, "Backtester": 4}.get(name) if name == "TradingBot" or \
+            isinstance(node.func, ast.Attribute) else None             # bare Backtester() is the pinned factory
+        if needs and len(node.args) < needs:
+            offenders.append(f"line {node.lineno}: {ast.unparse(node.func)}(...) without explicit configs")
+    assert not offenders, "use the pinned CFG / RISK / BT / EXEC (with replace()): " + "; ".join(offenders)
+    for const, cls in ((CFG, StrategyConfig), (RISK, RiskConfig), (BT, BacktestConfig)):
+        assert {f.name for f in dataclasses.fields(cls)} <= set(dataclasses.asdict(const))
+
+
+def test_rank_metric_and_candidate_order():
+    natr = replace(CFG, signal_rank_by="natr")
+    metrics = {"BBB": 0.02, "AAA": 0.02, "CCC": 0.03, "DDD": float("-inf")}
+    assert rank_candidates(["DDD", "BBB", "AAA", "CCC"], metrics, ["DDD", "CCC", "BBB", "AAA"], natr) == \
+        ["CCC", "AAA", "BBB", "DDD"]                       # metric descending, ties by name, NaN last
+    assert rank_candidates(["BBB", "AAA", "CCC"], metrics, ["CCC", "BBB", "AAA"], CFG) == ["CCC", "BBB", "AAA"]
+    snap = {"natr": 0.012, "adx": 31.0, "close": 110.0, "ema_slow": 100.0}
+    assert rank_metric(snap, natr) == 0.012
+    assert rank_metric(snap, replace(CFG, signal_rank_by="adx")) == 31.0
+    assert rank_metric(snap, replace(CFG, signal_rank_by="rs_ema")) == pytest.approx(0.10)
+    assert rank_metric({"natr": float("nan")}, natr) == float("-inf")
+    with pytest.raises(ValueError):
+        rank_metric(snap, replace(CFG, signal_rank_by="volume"))
+
+
+def test_relative_strength_filter():
+    spreads = {"SPY": 0.05, "AAA": 0.08, "BBB": 0.02, "CCC": 0.04, "DDD": float("nan")}
+    universe = ["SPY", "AAA", "BBB", "CCC", "DDD"]
+    bench = replace(CFG, rs_filter="vs_benchmark")
+    assert relative_strength_ok("AAA", spreads, bench, universe)[0]
+    ok, code, why = relative_strength_ok("BBB", spreads, bench, universe)
+    assert not ok and code == R_RS and "SPY" in why
+    assert relative_strength_ok("SPY", spreads, bench, universe)[0]                 # equal to itself
+    assert relative_strength_ok("AAA", {"AAA": 0.08}, bench, universe)[:2] == (False, R_RS_NO_BENCHMARK)
+    median = replace(CFG, rs_filter="vs_median")                                    # median 0.045
+    assert [relative_strength_ok(s, spreads, median, universe)[0] for s in ("SPY", "AAA", "BBB", "CCC")] == \
+        [True, True, False, False]
+    assert not relative_strength_ok("DDD", spreads, median, universe)[0]            # no spread: fail closed
+    assert relative_strength_ok("BBB", spreads, CFG, universe) == (True, "", "")    # filter off
+
+
+def simultaneous_universe(portfolio) -> dict[str, pd.DataFrame]:
+    """Four symbols whose entry signals fire on the same five bars: scaled copies of one path
+    (identical NATR, so ranking ties are broken by name) and one with 30% larger log moves
+    (higher NATR and a wider Close/EMA200 spread). List order is BBB, AAA, DDD, CCC."""
+    base = portfolio["SYN1"]
+    amplified = np.exp(np.log(100.0) + 1.3 * (np.log(base[OHLC]) - np.log(100.0)))
+    out = {"BBB": base[OHLC] * 2.0, "AAA": base[OHLC].copy(), "DDD": base[OHLC] * 3.0, "CCC": amplified}
+    return {s: df.assign(volume=base["volume"]) for s, df in out.items()}
+
+
+TWO_SLOTS = replace(RISK, max_open_positions=2, max_position_notional=0.30)
+
+
+def _first_batch(trades: pd.DataFrame) -> set:
+    first = trades["entry_time"].min()
+    return set(trades.loc[trades["entry_time"] == first, "symbol"])
+
+
+@pytest.mark.slow
+def test_backtest_ranks_simultaneous_signals(portfolio):
+    data = {s: df[OHLC] for s, df in simultaneous_universe(portfolio).items()}
+    ranked = Backtester(RANKED, TWO_SLOTS).run(data)
+    listed = Backtester(TRAIL, TWO_SLOTS).run(data)
+    assert _first_batch(ranked.trades) == {"CCC", "AAA"}          # highest NATR, then the tie by name
+    assert _first_batch(listed.trades) == {"BBB", "AAA"}          # v2: symbol list order
+    assert ranked.metrics["unfunded_capacity"] >= 2 and ranked.metrics["unfunded_capital"] == 0
+    adx = Backtester(replace(RANKED, signal_rank_by="adx"), TWO_SLOTS).run(data)
+    assert len(_first_batch(adx.trades)) == 2
+
+
+@pytest.mark.slow
+def test_backtest_gross_exposure_cap(portfolio):
+    data = {s: df[OHLC] for s, df in simultaneous_universe(portfolio).items()}
+    capped = replace(RISK, max_position_notional=0.50, max_gross_exposure=0.60)
+    trades = Backtester(RANKED, capped).run(data).trades
+    assert (trades["binding_constraint"] == "BUYING_POWER").any(), "the cap must bind for this test to bite"
+    for t in trades["entry_time"].unique():
+        held = trades[(trades["entry_time"] <= t) & (trades["exit_time"] > t)]
+        assert held["notional_pct"].sum() <= 0.60 + 0.03          # entry notionals; prices drift a little
+    first = trades[trades["entry_time"] == trades["entry_time"].min()].set_index("symbol")
+    assert set(first.index) == {"CCC", "AAA"} and first.loc["CCC", "binding_constraint"] != "BUYING_POWER"
+    assert first.loc["AAA", "binding_constraint"] == "BUYING_POWER"          # funded with what was left
+    assert first["notional_pct"].sum() == pytest.approx(0.60, abs=0.01)
+
+
+def test_cash_yield_and_excess_sharpe(portfolio):
+    data = {"SYN1": portfolio["SYN1"][OHLC]}
+    no_trades = replace(RISK, max_open_positions=0)
+    flat = Backtester(CFG, no_trades, replace(BT, cash_yield=0.05)).run(data)
+    days = flat.metrics["n_days"]
+    assert flat.metrics["n_trades"] == 0 and flat.metrics["unfunded_capacity"] > 0
+    assert flat.equity.iloc[0] == pytest.approx(BT.initial_equity)       # no interest during warm-up
+    assert flat.metrics["total_return"] == pytest.approx((1 + 0.05 / 252) ** (days - 1) - 1)
+    assert flat.metrics["benchmark"]["cash_return"] == pytest.approx(flat.metrics["total_return"])
+    assert np.isnan(flat.metrics["sharpe"])                               # cash alone has no excess return
+    plain = Backtester(TRAIL).run(data)
+    paid = Backtester(TRAIL, bt_cfg=replace(BT, cash_yield=0.05)).run(data)
+    assert list(paid.trades["entry_time"]) == list(plain.trades["entry_time"])
+    assert paid.metrics["final_equity"] > plain.metrics["final_equity"]
+    raw = backtest.equity_stats(paid.equity)["sharpe"]                   # same curve, not net of cash
+    assert paid.metrics["sharpe"] == pytest.approx(backtest.equity_stats(paid.equity, 0.05)["sharpe"])
+    assert paid.metrics["sharpe"] < raw
+    sheet = format_tear_sheet(paid)
+    assert "excess of 5.00% cash yield" in sheet and "Cash at 5.00%" in sheet
+
+
+def test_spy_buy_and_hold_benchmark(portfolio):
+    data = {"SPY": portfolio["SYN7"][OHLC], "SYN1": portfolio["SYN1"][OHLC]}
+    result = Backtester(TRAIL).run(data)
+    closes = data["SPY"]["close"].reindex(result.equity.index)
+    spy = result.metrics["benchmark"]["spy"]
+    assert spy["total_return"] == pytest.approx(closes.iloc[-1] / closes.iloc[0] - 1)
+    assert "SPY buy & hold" in format_tear_sheet(result)
+    assert Backtester(TRAIL).run({"SYN1": data["SYN1"]}).metrics["benchmark"]["spy"] is None
+
+
+@pytest.mark.slow
+def test_compare_heat_study_and_core_universe_row(portfolio):
+    data = {s: df[OHLC] for s, df in simultaneous_universe(portfolio).items()}
+    tables = backtest.compare_variants(data, None, BT, EXEC, None, RANKED, RISK, core=["AAA", "BBB"])
+    rows = tables["portfolio"].set_index("variant")
+    assert "v3, core universe only (2 sym)" in rows.index
+    assert rows.loc["v3, core universe only (2 sym)", "trades"] < rows.loc[backtest.DEFAULTS_ROW, "trades"]
+    assert "v3 + RS filter >= benchmark" not in rows.index                # no SPY in these bars
+    heat = tables["heat"]
+    assert len(heat) == 2 * len(backtest.HEAT_NOTIONALS)
+    assert set(heat["rank"]) == {"list order", "natr"}
+    wide = heat[heat["notional"] == 0.50]
+    assert (wide["unfunded_capital"] > 0).all()                          # 2 x 50% fills the account
+    assert wide.set_index("rank").loc["natr", "trades"] > 0
+    text = backtest.format_comparison(tables)
+    assert "Heat / sizing study" in text and "core universe only" in text
+
+
+def test_backtest_cli_universe_flag(tmp_path, portfolio, capsys):
+    path = str(tmp_path / "bars.csv.gz")
+    save_bars({"SYN1": with_session_columns(portfolio["SYN1"])}, path)
+    assert backtest.main(["--from-bars", path, "--universe", "expanded12", "--ledger", str(tmp_path / "l.csv"),
+                          "--earnings", str(tmp_path / "x")]) == 1
+    assert "META" in capsys.readouterr().out                             # names the missing symbols
+
+
+def _run_bot_window(bars: dict[str, pd.DataFrame], tmp_path, cfg, risk, start: int, stop: int, name: str):
+    broker = FakeBroker(bars)
+    journal = TradeJournal(str(tmp_path / f"{name}.csv"))
+    bot = _make_bot(broker, journal, symbols=list(bars), cfg=cfg, risk=risk)
+    first = next(iter(bars.values()))
+    for when in _decision_times(first, start, stop):
+        _step(bot, broker, when)
+    return broker, read_journal(journal.path)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("cfg", [RANKED, TRAIL], ids=["ranked", "list-order"])
+def test_live_bot_allocates_like_the_backtest(portfolio, tmp_path, cfg):
+    """Portfolio parity on simultaneous signals: the bot must fund the same symbols on the same
+    bars as the backtester, in the same order, when slots run out."""
+    universe = simultaneous_universe(portfolio)
+    risk = replace(LIVE_RISK, max_open_positions=2, max_position_notional=0.30)
+    trades = Backtester(cfg, risk).run({s: df[OHLC] for s, df in universe.items()}).trades
+    bars = {s: with_session_columns(df) for s, df in universe.items()}
+    index = next(iter(bars.values())).index
+    first = index.get_loc(trades["entry_time"].min())
+    window_end = first + 120
+    _, log = _run_bot_window(bars, tmp_path, cfg, risk, first - 1, window_end, cfg.signal_rank_by or "listed")
+    expected = trades[trades["entry_time"] <= index[window_end - 1]]
+    expected = sorted(zip(expected["entry_time"], expected["symbol"]))
+    fills = log[log["event"] == J.ENTRY_FILL]
+    got = sorted(zip(fills["ts_utc"].map(lambda t: index[index.get_indexer([t.tz_convert(ET.zone)],
+                                                                          method="ffill")[0]]), fills["symbol"]))
+    assert len(expected) >= 4 and got == expected
+    checks = log[log["event"] == J.BAR_CHECK]
+    assert checks["reason_detail"].str.contains("rank 1/4").any()
+    assert (checks["action"] == "BLOCKED_MAX_OPEN_POSITIONS").sum() >= 2
+
+
+def test_live_entries_wait_for_the_whole_cross_section(portfolio, tmp_path):
+    universe = simultaneous_universe(portfolio)
+    bars = {s: with_session_columns(df) for s, df in universe.items()}
+    risk = replace(LIVE_RISK, max_open_positions=2, max_position_notional=0.30)
+    signal_bar = generate_signals(universe["AAA"][OHLC], RANKED)["entry"].idxmax()
+    when = signal_bar + pd.Timedelta(seconds=25)
+    for late_for, expected in ((30, {"CCC", "AAA"}), (EXEC.rank_wait_seconds, {"AAA", "BBB"})):
+        broker = FakeBroker(bars)
+        bot = _make_bot(broker, TradeJournal(str(tmp_path / f"late-{late_for}.csv")), symbols=list(bars),
+                        cfg=RANKED, risk=risk)
+        broker.late = {"CCC"}
+        assert _step(bot, broker, when) == "WAITING_FOR_BARS" and broker.submitted == []
+        if late_for == 30:
+            broker.late = set()                                    # CCC's bar arrives at the next heartbeat
+        assert _step(bot, broker, when + pd.Timedelta(seconds=late_for)) in {"EVALUATED", "WAITING_FOR_BARS"}
+        assert {o["symbol"] for o in broker.submitted} == expected
+        assert [o["symbol"] for o in broker.submitted][0] == ("CCC" if late_for == 30 else "AAA")
+
+
+def test_live_gross_cap_counts_open_positions(portfolio, tmp_path):
+    universe = simultaneous_universe(portfolio)
+    bars = {s: with_session_columns(df) for s, df in universe.items()}
+    risk = replace(LIVE_RISK, max_position_notional=0.50, max_gross_exposure=0.60)
+    signal_bar = generate_signals(universe["AAA"][OHLC], RANKED)["entry"].idxmax()
+    broker = FakeBroker(bars)
+    journal = TradeJournal(str(tmp_path / "gross.csv"))
+    bot = _make_bot(broker, journal, symbols=list(bars), cfg=RANKED, risk=risk)
+    _step(bot, broker, signal_bar + pd.Timedelta(seconds=25))
+    notional = {o["symbol"]: o["qty"] * float(broker.positions[o["symbol"]].avg_entry_price) for o in broker.submitted}
+    assert [o["symbol"] for o in broker.submitted][:2] == ["CCC", "AAA"]
+    # Sized at the reference close, filled 3 bp higher; the 4x margin buying power is never used.
+    assert sum(notional.values()) <= 0.60 * broker.equity * 1.0005
+    assert sum(notional.values()) == pytest.approx(0.60 * broker.equity, rel=0.01)
+    checks = read_journal(journal.path).query("event == @J.BAR_CHECK").set_index("symbol")
+    assert checks.loc["AAA", "binding_constraint"] == "BUYING_POWER"
+    assert checks.loc["BBB", "action"] == "BLOCKED_SIZE_ZERO"
+
+
+def test_live_rs_filter_fetches_the_benchmark_and_blocks_laggards(portfolio, tmp_path):
+    universe = simultaneous_universe(portfolio)
+    bars = {s: with_session_columns(df) for s, df in universe.items()}
+    bars["BEN"] = bars.pop("CCC")                                   # widest spread; compared with, not traded
+    cfg = replace(RANKED, rs_filter="vs_benchmark", rs_benchmark="BEN")
+    signal_bar = generate_signals(universe["AAA"][OHLC], cfg)["entry"].idxmax()
+    broker = FakeBroker(bars)
+    journal = TradeJournal(str(tmp_path / "rs.csv"))
+    bot = _make_bot(broker, journal, symbols=["AAA", "BBB", "DDD"], cfg=cfg)
+    _step(bot, broker, signal_bar + pd.Timedelta(seconds=25))
+    checks = read_journal(journal.path).query("event == @J.BAR_CHECK").set_index("symbol")
+    assert broker.submitted == [] and set(checks.index) == {"AAA", "BBB", "DDD"}
+    assert (checks["reason_code"] == R_RS).all() and checks["reason_detail"].str.contains("BEN").all()
+    bars["DDD"] = bars["BEN"]                                       # equal spread passes (>=)
+    broker = FakeBroker(bars)
+    bot = _make_bot(broker, TradeJournal(str(tmp_path / "rs2.csv")), symbols=["AAA", "DDD"], cfg=cfg)
+    _step(bot, broker, signal_bar + pd.Timedelta(seconds=25))
+    assert [o["symbol"] for o in broker.submitted] == ["DDD"]

@@ -9,6 +9,9 @@ Uses the exact strategy, sizing and kill-switch code the live bot uses:
     entries and on market/stop exits; take-profit limits fill at the limit with no slippage, and
     only when the high trades through the target by a cent
   - stops and targets that gap are filled at the open; if a bar touches both, the stop wins
+  - each bar: exits first, then entry candidates ranked by StrategyConfig.signal_rank_by and
+    funded in that order from min(cash, equity * max_gross_exposure - open exposure), the same
+    two-pass allocation the live bot runs
 
 "Walk-forward" here means a strictly causal bar-by-bar simulation, reported per
 chronological fold. Parameters are fixed in config.py, so nothing is fitted in-sample;
@@ -17,6 +20,7 @@ the folds show whether the edge is stable through time or comes from one period.
 Usage (on a machine with network access and a .env):
     python backtest.py                       # 2 years, config universe
     python backtest.py --years 1 --symbols SPY QQQ --feed sip --trades-out trades.csv
+    python backtest.py --universe expanded12 --feed sip --save-bars bars_x12.csv.gz --compare
 """
 from __future__ import annotations
 
@@ -35,7 +39,8 @@ from config import BacktestConfig, ExecutionConfig, RiskConfig, StrategyConfig
 from src.events import EarningsCalendar, entry_blackout, events_per_year, forced_exit, load_earnings_calendar
 from src.risk_manager import RiskManager, r_multiple
 from src.sessions import ET, in_trading_window
-from src.strategy import R_EARNINGS, generate_signals, ratchet_stop, stop_too_close
+from src.strategy import (R_EARNINGS, generate_signals, rank_candidates, rank_metric, ratchet_stop,
+                          relative_strength_ok, stop_too_close, trend_spread)
 
 TRADING_DAYS = 252
 # Signal-bar (t-1) values written next to each trade so conditional effects can be studied
@@ -148,21 +153,23 @@ def trade_stats(r_values: pd.Series, pnl: pd.Series) -> dict:
     }
 
 
-def equity_stats(equity: pd.Series) -> dict:
-    """Sharpe/Sortino from daily returns (annualised with sqrt(252)), drawdown from every bar."""
+def equity_stats(equity: pd.Series, risk_free: float = 0.0) -> dict:
+    """Sharpe/Sortino from daily returns in excess of `risk_free` (annual), annualised with
+    sqrt(252); drawdown from every bar."""
     if equity.empty:
         return {key: float("nan") for key in ("total_return", "cagr", "sharpe", "sortino", "max_drawdown",
                                               "volatility")} | {"n_days": 0}
     daily = equity.groupby(equity.index.tz_convert(ET).date).last()
-    returns = daily.pct_change().dropna()
+    returns = daily.pct_change().dropna() - risk_free / TRADING_DAYS
     n_days = len(daily)
     total_return = equity.iloc[-1] / equity.iloc[0] - 1.0
     years = max(n_days / TRADING_DAYS, 1e-9)
     cagr = (1.0 + total_return) ** (1.0 / years) - 1.0 if total_return > -1 else -1.0
     std = returns.std(ddof=1) if len(returns) > 1 else float("nan")
     downside = math.sqrt((returns.clip(upper=0.0) ** 2).mean()) if len(returns) else float("nan")
-    sharpe = returns.mean() / std * math.sqrt(TRADING_DAYS) if std and std > 0 else float("nan")
-    sortino = returns.mean() / downside * math.sqrt(TRADING_DAYS) if downside and downside > 0 else float("nan")
+    # A curve that only earns the cash yield has ~1e-17 excess-return noise: no Sharpe, not +/-7.
+    sharpe = returns.mean() / std * math.sqrt(TRADING_DAYS) if std and std > 1e-12 else float("nan")
+    sortino = returns.mean() / downside * math.sqrt(TRADING_DAYS) if downside and downside > 1e-12 else float("nan")
     drawdown = equity / equity.cummax() - 1.0
     return {
         "total_return": float(total_return),
@@ -207,8 +214,27 @@ class Backtester:
         for symbol, df in data.items():
             df = df.sort_index()
             sig = generate_signals(df[["open", "high", "low", "close"]], self.scfg).add_prefix("sig_")
-            frames[symbol] = df[["open", "high", "low", "close"]].join(sig)
+            frame = df[["open", "high", "low", "close"]].join(sig)
+            frame["spread"] = [trend_spread(c, e) for c, e in zip(frame["sig_close"], frame["sig_ema_slow"])]
+            frame["rs_ok"], frame["rs_reason"] = True, ""
+            frames[symbol] = frame
+        if self.scfg.rs_filter is not None:
+            self._apply_relative_strength(frames)
         return frames
+
+    def _apply_relative_strength(self, frames: dict[str, pd.DataFrame]) -> None:
+        """Cross-sectional RS on every entry row, with the same scalar function the live bot uses
+        on the symbols it fetched for that bar."""
+        spreads = pd.DataFrame({s: f["spread"] for s, f in frames.items()})
+        universe = list(frames)
+        for symbol, frame in frames.items():
+            for ts in frame.index[frame["sig_entry"].to_numpy()]:
+                row = spreads.loc[ts]
+                values = {s: float(v) for s, v in row.items() if pd.notna(v)}
+                ok, code, _ = relative_strength_ok(symbol, values, self.scfg, universe)
+                if not ok:
+                    frame.loc[ts, "rs_ok"] = False
+                    frame.loc[ts, "rs_reason"] = code
 
     def _window_ok(self, ts) -> bool:
         return in_trading_window(ts, self.ecfg.trade_window_start, self.ecfg.trade_window_end)
@@ -286,9 +312,17 @@ class Backtester:
 
     def run(self, data: dict[str, pd.DataFrame], start: Optional[pd.Timestamp] = None) -> BacktestResult:
         """`data`: symbol -> session-aligned hourly OHLCV (tz-aware index = bar start).
-        Bars before `start` only warm up indicators; no trades and no equity are recorded there."""
+        Bars before `start` only warm up indicators; no trades and no equity are recorded there.
+
+        Each bar is processed in three phases, mirroring the live bot's cycle:
+          1. exits and stop ratchets of open positions (at the open of bar t)
+          2. new entries: candidates ranked by signal_rank_by, then funded in that order from
+             capital = min(cash, equity * max_gross_exposure - gross exposure)
+          3. bracket legs during bar t
+        A symbol that held a position when the bar opened cannot re-enter on that bar."""
         risk = RiskManager(self.rcfg, self.scfg)
         frames = self._prepare(data)
+        order = list(frames)
         rows_by_symbol = {s: dict(zip(f.index, f.itertuples(index=False))) for s, f in frames.items()}
         timeline = sorted(set().union(*[f.index for f in frames.values()]))
         if start is not None:
@@ -296,7 +330,8 @@ class Backtester:
         cash = self.bcfg.initial_equity
         positions: dict[str, Position] = {}
         last_close: dict[str, float] = {}
-        trades, events, curve, reasons = [], [], [], []
+        trades, events, curve, reasons, gross_share = [], [], [], [], []
+        unfunded = {"capacity": 0, "capital": 0}
         equity = cash
         day_start_equity, current_day = equity, None
 
@@ -311,33 +346,63 @@ class Backtester:
             active = start is None or ts >= start
             day = ts.tz_convert(ET).date()
             if day != current_day:
+                if curve and self.bcfg.cash_yield and cash > 0:
+                    # One trading day of interest on yesterday's idle cash (evaluated days only).
+                    cash += cash * self.bcfg.cash_yield / TRADING_DAYS
+                    equity = cash + sum(p.qty * last_close[s] for s, p in positions.items())
                 current_day, day_start_equity = day, equity
             window_ok = self._window_ok(ts)
+            rows_now = {s: rows[ts] for s, rows in rows_by_symbol.items() if ts in rows}
+            held_at_open = set(positions)
 
-            for symbol, rows in rows_by_symbol.items():
-                row = rows.get(ts)
-                if row is None:
-                    continue
+            # 1) Exits and ratchets at the open of bar t, from bar t-1 information.
+            for symbol, row in rows_now.items():
                 pos = positions.get(symbol)
-
-                # 1) Decisions made at the open of bar t from bar t-1 information.
                 if pos is not None:
                     self._advance(pos, row)
                     exit_ = self._decision_exit(pos, row, self._must_exit(symbol, ts)) if window_ok else None
                     if exit_:
                         close_trade(pos, ts, *exit_)
-                        pos = None
-                elif active:
-                    blackout = self._entry_blocked(symbol, ts)
-                    reasons.append(R_EARNINGS if blackout else row.sig_reason_code)
-                    if (window_ok and bool(row.sig_entry) and not blackout and not risk.is_halted(day)
-                            and len(positions) < self.rcfg.max_open_positions):
-                        size = risk.size_position(equity, float(row.sig_close), float(row.sig_atr), buying_power=cash)
-                        if size.shares >= 1:
-                            pos = positions[symbol] = self._new_position(symbol, ts, row, size)
-                            cash -= size.shares * pos.entry_fill
 
-                # 2) Bracket legs during bar t.
+            # 2) Entries: rank simultaneous candidates, fund them in order.
+            if active:
+                candidates = []
+                for symbol, row in rows_now.items():
+                    if symbol in held_at_open:
+                        continue
+                    blackout = self._entry_blocked(symbol, ts)
+                    if blackout:
+                        reasons.append(R_EARNINGS)
+                    elif bool(row.sig_entry) and not bool(row.rs_ok):
+                        reasons.append(row.rs_reason)
+                    else:
+                        reasons.append(row.sig_reason_code)
+                    if (window_ok and bool(row.sig_entry) and bool(row.rs_ok) and not blackout
+                            and not risk.is_halted(day)):
+                        candidates.append(symbol)
+                metrics = {sym: rank_metric({"natr": rows_now[sym].sig_natr, "adx": rows_now[sym].sig_adx,
+                                             "close": rows_now[sym].sig_close,
+                                             "ema_slow": rows_now[sym].sig_ema_slow}, self.scfg)
+                           for sym in candidates}
+                gross = sum(p.qty * last_close[s] for s, p in positions.items())
+                capital = min(cash, equity * self.rcfg.max_gross_exposure - gross)
+                for symbol in rank_candidates(candidates, metrics, order, self.scfg):
+                    row = rows_now[symbol]
+                    if len(positions) >= self.rcfg.max_open_positions:
+                        unfunded["capacity"] += 1
+                        continue
+                    size = risk.size_position(equity, float(row.sig_close), float(row.sig_atr),
+                                              buying_power=max(capital, 0.0))
+                    if size.shares < 1:
+                        unfunded["capital"] += 1
+                        continue
+                    pos = positions[symbol] = self._new_position(symbol, ts, row, size)
+                    cash -= size.shares * pos.entry_fill
+                    capital -= size.shares * pos.entry_fill
+
+            # 3) Bracket legs during bar t.
+            for symbol, row in rows_now.items():
+                pos = positions.get(symbol)
                 if pos is not None:
                     hit = self._bracket_exit(pos, row)
                     if hit:
@@ -346,9 +411,11 @@ class Backtester:
                         pos.bars_held += 1
                 last_close[symbol] = float(row.close)
 
-            # 3) Mark to market at the close of bar t, then the daily kill-switch.
-            equity = cash + sum(p.qty * last_close[s] for s, p in positions.items())
+            # 4) Mark to market at the close of bar t, then the daily kill-switch.
+            gross = sum(p.qty * last_close[s] for s, p in positions.items())
+            equity = cash + gross
             if active:
+                gross_share.append(gross / equity if equity > 0 else 0.0)
                 status = risk.check_daily_drawdown(day, day_start_equity, equity)
                 if status.newly_tripped:
                     events.append({"time": ts, "event": "KILL_SWITCH", "daily_pnl_pct": status.daily_pnl_pct})
@@ -368,7 +435,26 @@ class Backtester:
 
         trades_df = pd.DataFrame(trades)
         equity_curve = pd.Series(dict(curve), dtype=float).sort_index()
-        return self._summarise(trades_df, equity_curve, pd.Series(reasons, dtype=object), events, list(frames))
+        result = self._summarise(trades_df, equity_curve, pd.Series(reasons, dtype=object), events, list(frames))
+        result.metrics["unfunded_capacity"] = unfunded["capacity"]
+        result.metrics["unfunded_capital"] = unfunded["capital"]
+        result.metrics["avg_gross"] = float(np.mean(gross_share)) if gross_share else float("nan")
+        result.metrics["max_gross"] = float(np.max(gross_share)) if gross_share else float("nan")
+        result.metrics["benchmark"] = self._benchmark(frames, equity_curve)
+        return result
+
+    def _benchmark(self, frames: dict[str, pd.DataFrame], equity_curve: pd.Series) -> dict:
+        """SPY buy-and-hold over the same evaluated bars, and cash at cash_yield, for context."""
+        out = {"cash_return": float("nan"), "spy": None}
+        if equity_curve.empty:
+            return out
+        accruals = len(set(equity_curve.index.tz_convert(ET).date)) - 1       # one per day after the first
+        out["cash_return"] = (1 + self.bcfg.cash_yield / TRADING_DAYS) ** accruals - 1
+        if "SPY" in frames:
+            closes = frames["SPY"]["close"].reindex(equity_curve.index).ffill().dropna()
+            if len(closes) > 1:
+                out["spy"] = equity_stats(closes / closes.iloc[0] * self.bcfg.initial_equity, self.bcfg.cash_yield)
+        return out
 
     def signal_outcomes(self, data: dict[str, pd.DataFrame], start: Optional[pd.Timestamp] = None) -> pd.DataFrame:
         """Every tradable entry signal simulated on its own (no portfolio interaction, 1 share):
@@ -379,7 +465,7 @@ class Backtester:
         for symbol, frame in self._prepare(data).items():
             index = frame.index
             rows = list(frame.itertuples(index=False))
-            for i in np.flatnonzero(frame["sig_entry"].to_numpy()):
+            for i in np.flatnonzero((frame["sig_entry"] & frame["rs_ok"]).to_numpy()):
                 ts = index[i]
                 if (start is not None and ts < start) or not self._window_ok(ts) or self._entry_blocked(symbol, ts):
                     continue
@@ -413,7 +499,7 @@ class Backtester:
                                            "nights", "pnl", "exit_reason", "bars_held", "risk_pct", "notional_pct",
                                            "binding_constraint", "slippage_cost"])
         stats = trade_stats(trades["r_multiple"], trades["pnl"])
-        metrics = {**equity_stats(equity), **stats}
+        metrics = {**equity_stats(equity, self.bcfg.cash_yield), **stats}
         metrics["initial_equity"] = float(self.bcfg.initial_equity)
         metrics["final_equity"] = float(equity.iloc[-1]) if len(equity) else float(self.bcfg.initial_equity)
         metrics["avg_bars_held"] = float(trades["bars_held"].mean()) if len(trades) else float("nan")
@@ -430,7 +516,7 @@ class Backtester:
                 seg = equity.iloc[chunk]
                 lo, hi = seg.index[0], seg.index[-1]
                 in_fold = trades[(trades["entry_time"] >= lo) & (trades["entry_time"] <= hi)] if len(trades) else trades
-                fold_eq = equity_stats(seg)
+                fold_eq = equity_stats(seg, self.bcfg.cash_yield)
                 fold_tr = trade_stats(in_fold["r_multiple"], in_fold["pnl"])
                 folds.append({"fold": i, "start": lo, "end": hi, "trades": fold_tr["n_trades"],
                               "return": fold_eq["total_return"], "sharpe": fold_eq["sharpe"],
@@ -467,6 +553,28 @@ def _num(x: float, fmt: str = ".2f") -> str:
     return "inf" if math.isinf(x) else format(x, fmt)
 
 
+def _excess_label(result: BacktestResult) -> str:
+    y = result.config["backtest"].get("cash_yield", 0.0)
+    return f"   (excess of {y:.2%} cash yield)" if y else ""
+
+
+def _benchmark_lines(result: BacktestResult) -> list[str]:
+    bench, m = result.metrics.get("benchmark") or {}, result.metrics
+    y = result.config["backtest"].get("cash_yield", 0.0)
+    out = []
+    spy = bench.get("spy")
+    if spy:
+        out.append(f" SPY buy & hold      {_pct(spy['total_return'])}   CAGR {_pct(spy['cagr'])}   Sharpe "
+                   f"{_num(spy['sharpe'])}   maxDD {_pct(spy['max_drawdown'])}   (same bars, dividends adjusted)")
+    if y:
+        out.append(f" Cash at {y:.2%}       {_pct(bench.get('cash_return'))} over the same days "
+                   f"(strategy equity already earns it on idle cash)")
+    else:
+        out.append(" Cash               not modelled (--cash-yield 0): T-bills paid ~4-5% a year in 2023-2025,"
+                   " compare CAGR with that")
+    return out
+
+
 def format_tear_sheet(result: BacktestResult, title: str = "BACKTEST TEAR SHEET") -> str:
     m = result.metrics
     eq = result.equity
@@ -478,7 +586,7 @@ def format_tear_sheet(result: BacktestResult, title: str = "BACKTEST TEAR SHEET"
         f" Bars / costs        session-aligned 1h | slippage {result.config['backtest']['slippage_pct']:.2%} per side",
         f" Equity              ${m['initial_equity']:,.2f} -> ${m['final_equity']:,.2f}",
         f" Total return        {_pct(m['total_return'])}   CAGR {_pct(m['cagr'])}   Ann. vol {_pct(m['volatility'], False)}",
-        f" Sharpe (ann.)       {_num(m['sharpe'])}",
+        f" Sharpe (ann.)       {_num(m['sharpe'])}{_excess_label(result)}",
         f" Sortino (ann.)      {_num(m['sortino'])}",
         f" Max drawdown        {_pct(m['max_drawdown'])}",
         f" Profit factor       {_num(m['profit_factor'])}",
@@ -491,6 +599,17 @@ def format_tear_sheet(result: BacktestResult, title: str = "BACKTEST TEAR SHEET"
         f"{_num(m['avg_nights'], '.1f')}",
         f" Kill-switch trips   {m['kill_switch_events']}",
     ]
+    if "avg_gross" in m:
+        s_cfg, r_cfg = result.config["strategy"], result.config["risk"]
+        lines += [
+            f" Sizing              {r_cfg['risk_per_trade']:.1%} risk | {r_cfg['max_position_notional']:.0%} notional cap | "
+            f"{r_cfg['max_gross_exposure']:.0%} gross cap | max {r_cfg['max_open_positions']} positions",
+            f" Capital use         avg gross {_pct(m['avg_gross'], False)} of equity (max {_pct(m['max_gross'], False)}) | "
+            f"signals not funded: {m['unfunded_capacity']} (positions full) + {m['unfunded_capital']} (no capital)",
+            f" Ranking / RS        rank by {s_cfg['signal_rank_by'] or 'symbol list order'} | "
+            f"RS filter {s_cfg['rs_filter'] or 'off'}",
+        ]
+        lines += _benchmark_lines(result)
     trades = result.trades
     if len(trades):
         exits = trades["exit_reason"].value_counts()
@@ -521,21 +640,27 @@ def format_tear_sheet(result: BacktestResult, title: str = "BACKTEST TEAR SHEET"
 
 
 # ----------------------------------------------------------------------------- variant comparison
-V1_SPEC = dict(exit_mode="ema_cross", max_cost_r=None, directional_check=None, max_hold_bars=None)
+V1_SPEC = dict(exit_mode="ema_cross", max_cost_r=None, directional_check=None, max_hold_bars=None,
+               signal_rank_by=None, rs_filter=None)
 EXCLUDE = "_exclude_symbols"
+DEFAULTS_ROW = "v3 (defaults)"
 
-# Portfolio runs: each v2 change in isolation on top of the v1 spec, then the v2 defaults.
+# Portfolio runs. The v1 rows isolate one rule change each (no earnings blackout); the v3 rows
+# change one v3 setting at a time on top of the defaults (with the blackout). All rows use the
+# same sizing; the heat study varies it.
 COMPARE_VARIANTS = {
     "v1 (original spec)": V1_SPEC,
     "v1 + bracket exit": dict(V1_SPEC, exit_mode="bracket"),
     "v1 + ratchet exit": dict(V1_SPEC, exit_mode="ratchet"),
-    "v1 + bracket + 14-bar time stop": dict(V1_SPEC, exit_mode="bracket", max_hold_bars=14),
-    "v1 + cost floor 0.10R": dict(V1_SPEC, max_cost_r=0.10),
-    "v1 without SPY, QQQ": dict(V1_SPEC, **{EXCLUDE: ("SPY", "QQQ")}),
-    "v1 + ADX/DI at pre-dip anchor": dict(V1_SPEC, directional_check="anchor"),
-    "v1 + +DI>-DI on signal bar": dict(V1_SPEC, directional_check="signal_bar"),
-    "v2 (defaults)": {},
+    "v3 without ranking (list order)": dict(signal_rank_by=None),
+    DEFAULTS_ROW: {},
+    "v3, rank by ADX": dict(signal_rank_by="adx"),
+    "v3, rank by Close/EMA200": dict(signal_rank_by="rs_ema"),
+    "v3 + RS filter >= benchmark": dict(rs_filter="vs_benchmark"),
+    "v3 + RS filter >= universe median": dict(rs_filter="vs_median"),
 }
+# max_position_notional x ranking. Same rules, calendar and gross cap in every cell.
+HEAT_NOTIONALS = (0.20, 0.33, 0.50)
 # Paired exit study: the same v1 entry signals, each exit rule simulated independently.
 EXIT_VARIANTS = {
     "ema_cross (v1)": dict(exit_mode="ema_cross"),
@@ -548,6 +673,8 @@ FILTER_VARIANTS = {
     "cost floor 0.10R": dict(max_cost_r=0.10),
     "ADX/DI at anchor": dict(directional_check="anchor"),
     "+DI>-DI signal bar": dict(directional_check="signal_bar"),
+    "RS >= benchmark": dict(rs_filter="vs_benchmark"),
+    "RS >= median": dict(rs_filter="vs_median"),
 }
 
 
@@ -582,6 +709,7 @@ def cluster_random_drop_percentile(r: np.ndarray, clusters: np.ndarray, kept_mea
 
 
 def _variant_row(name: str, result: BacktestResult) -> dict:
+    """One portfolio row: trade statistics, a week-robust CI and capital use."""
     trades, m = result.trades, result.metrics
     lo, hi = bootstrap_ci(trades["r_multiple"], clusters=week_clusters(trades["entry_time"])) \
         if len(trades) > 1 else (float("nan"), float("nan"))
@@ -595,34 +723,59 @@ def _variant_row(name: str, result: BacktestResult) -> dict:
             "expectancy_r": m["expectancy_r"], "ci_lo": lo, "ci_hi": hi, "gross_r": gross,
             "breakeven_bps": breakeven_bps, "profit_factor": m["profit_factor"], "max_drawdown": m["max_drawdown"],
             "best_symbol": best, "exp_without_best": without_best,
-            "nights": trades["nights"].mean() if len(trades) else float("nan")}
+            "nights": trades["nights"].mean() if len(trades) else float("nan"),
+            "cagr": m["cagr"], "sharpe": m["sharpe"], "avg_gross": m.get("avg_gross", float("nan")),
+            "unfunded_capacity": m.get("unfunded_capacity", 0), "unfunded_capital": m.get("unfunded_capital", 0),
+            "bp_bound": float((trades["binding_constraint"] == "BUYING_POWER").mean()) if len(trades) else float("nan")}
 
 
 def compare_variants(data: dict[str, pd.DataFrame], start, bt_cfg: BacktestConfig, exec_cfg: ExecutionConfig,
-                     calendar: Optional[EarningsCalendar] = None,
-                     base: Optional[StrategyConfig] = None) -> dict[str, pd.DataFrame]:
+                     calendar: Optional[EarningsCalendar] = None, base: Optional[StrategyConfig] = None,
+                     risk: Optional[RiskConfig] = None, core: Optional[list[str]] = None) -> dict[str, pd.DataFrame]:
+    """`core`: the smaller universe to compare with when `data` holds more symbols (expanded run)."""
     base = base or StrategyConfig()
-    portfolio = []
+    risk = risk or RiskConfig()
+    core = list(config.UNIVERSES["core5"] if core is None else core)
+    cache: dict = {}
+
+    def run(cfg: StrategyConfig, rcfg: RiskConfig, cal, excluded=()) -> BacktestResult:
+        key = (repr(cfg), repr(rcfg), cal is None, tuple(sorted(excluded)))
+        if key not in cache:
+            subset = {s: df for s, df in data.items() if s not in excluded}
+            cache[key] = Backtester(cfg, rcfg, bt_cfg, exec_cfg, cal).run(subset, start)
+        return cache[key]
+
     runs = []
     for name, overrides in COMPARE_VARIANTS.items():
         overrides = dict(overrides)
         excluded = overrides.pop(EXCLUDE, ())
-        if excluded and not set(excluded) & set(data):
-            continue
+        cfg = replace(base, **overrides)
+        if cfg.rs_filter == "vs_benchmark" and cfg.rs_benchmark not in data:
+            continue                                          # nothing to compare with
         # The v1 rows (baseline and "v1 + one change") run without the earnings blackout, so each
-        # isolates exactly one change; the blackout gets its own row and is included in v2.
-        runs.append((name, replace(base, **overrides), None if name.startswith("v1") else calendar, excluded))
+        # isolates exactly one change; the blackout gets its own row and is included in v3.
+        runs.append((name, cfg, None if name.startswith("v1") else calendar, excluded))
         if name.startswith("v1 (") and calendar:
-            runs.append(("v1 + earnings blackout", replace(base, **overrides), calendar, ()))
-    if calendar:
-        runs.append(("v2 without earnings blackout", base, None, ()))
-    for name, cfg, cal, excluded in runs:
-        subset = {s: df for s, df in data.items() if s not in excluded}
-        portfolio.append(_variant_row(name, Backtester(cfg, RiskConfig(), bt_cfg, exec_cfg, cal).run(subset, start)))
+            runs.append(("v1 + earnings blackout", cfg, calendar, ()))
+        if name == DEFAULTS_ROW:
+            if calendar:
+                runs.append(("v3 without earnings blackout", base, None, ()))
+            extra = [s for s in data if s not in core]
+            if extra and set(core) & set(data):
+                runs.append((f"v3, core universe only ({len(set(core) & set(data))} sym)", base, calendar, extra))
+    portfolio = [_variant_row(name, run(cfg, risk, cal, excluded)) for name, cfg, cal, excluded in runs]
+
+    heat = []
+    for rank in (None, base.signal_rank_by or "natr"):
+        for notional in HEAT_NOTIONALS:
+            row = _variant_row("", run(replace(base, signal_rank_by=rank), replace(risk, max_position_notional=notional),
+                                       calendar))
+            heat.append({**row, "notional": notional, "rank": rank or "list order"})
+    benchmark = run(base, risk, calendar).metrics.get("benchmark", {})
 
     # Paired exits on identical v1 entries: differences per signal cancel most of the noise.
     v1 = replace(base, **V1_SPEC)
-    outcomes = {name: Backtester(replace(v1, **overrides), RiskConfig(), bt_cfg, exec_cfg, calendar)
+    outcomes = {name: Backtester(replace(v1, **overrides), risk, bt_cfg, exec_cfg, calendar)
                 .signal_outcomes(data, start) for name, overrides in EXIT_VARIANTS.items()}
     baseline = outcomes["ema_cross (v1)"]
     exits = []
@@ -640,16 +793,18 @@ def compare_variants(data: dict[str, pd.DataFrame], start, bt_cfg: BacktestConfi
                       "delta_hi": hi, "nights": out["nights"].mean(),
                       "mix": ", ".join(f"{k} {v:.0%}" for k, v in mix.head(4).items())})
 
-    # Entry rules vs the v1 signals, all under the v2 default exit. A pure filter only removes
+    # Entry rules vs the v1 signals, all under the default exit. A pure filter only removes
     # signals; a replacement rule (e.g. the anchor check) can also add some, reported separately.
     def outcomes_for(overrides: dict) -> pd.DataFrame:
         cfg = replace(v1, exit_mode=base.exit_mode, **overrides)
-        return Backtester(cfg, RiskConfig(), bt_cfg, exec_cfg, calendar).signal_outcomes(data, start)
+        return Backtester(cfg, risk, bt_cfg, exec_cfg, calendar).signal_outcomes(data, start)
 
     reference = outcomes_for({})
     key = ["symbol", "entry_time"]
     filters = []
     for name, overrides in FILTER_VARIANTS.items():
+        if overrides.get("rs_filter") == "vs_benchmark" and base.rs_benchmark not in data:
+            continue
         variant = outcomes_for(overrides)
         merged = reference.merge(variant[key].assign(_in=True), on=key, how="left")
         kept_mask = merged["_in"].notna().to_numpy()
@@ -670,30 +825,60 @@ def compare_variants(data: dict[str, pd.DataFrame], start, bt_cfg: BacktestConfi
                         "added": len(added), "added_r": added["r_multiple"].mean() if len(added) else float("nan"),
                         "variant_r": variant["r_multiple"].mean() if len(variant) else float("nan"),
                         "random_drop_pct": percentile, "pure_filter": pure})
-    return {"portfolio": pd.DataFrame(portfolio), "exits": pd.DataFrame(exits), "filters": pd.DataFrame(filters)}
+    return {"portfolio": pd.DataFrame(portfolio), "exits": pd.DataFrame(exits), "filters": pd.DataFrame(filters),
+            "heat": pd.DataFrame(heat), "benchmark": benchmark,
+            "setup": {"risk": risk, "cash_yield": bt_cfg.cash_yield, "symbols": list(data), "core": core}}
 
 
 def format_comparison(tables: dict[str, pd.DataFrame], prior_runs: int = 0) -> str:
-    width = 118
+    width = 140
     lines = ["=" * width, " VARIANT COMPARISON (identical bars and costs; CIs are robust to same-week clustering)", "=" * width]
     if prior_runs:
         lines += [f" WARNING: this window was already evaluated in {prior_runs} earlier run(s) (see the ledger).",
                   " Every look spends it: it is no longer clean out-of-sample data for choosing a rule.", "-" * width]
-    lines.append(f" {'portfolio variant':<33} {'trades':>6} {'/yr':>5} {'exp R':>7} {'95% CI':>15} {'gross R':>7} "
-                 f"{'BE bp':>6} {'PF':>5} {'maxDD':>7} {'w/o best':>15} {'nights':>6}")
+    setup = tables.get("setup")
+    if setup:
+        r = setup["risk"]
+        lines.append(f" Symbols: {' '.join(setup['symbols'])} | sizing for every row: {r.risk_per_trade:.1%} risk, "
+                     f"{r.max_position_notional:.0%} notional cap, {r.max_gross_exposure:.0%} gross cap, "
+                     f"max {r.max_open_positions} positions | cash yield {setup['cash_yield']:.2%}")
+    lines.append(f" {'portfolio variant':<36} {'trades':>6} {'/yr':>4} {'exp R':>7} {'95% CI':>15} {'gross R':>7} "
+                 f"{'BE bp':>6} {'PF':>5} {'CAGR':>7} {'Sharpe':>6} {'maxDD':>7} {'w/o best':>15} {'nights':>6} "
+                 f"{'unfunded':>8}")
     for _, r in tables["portfolio"].iterrows():
         ci = f"[{_num(r['ci_lo'], '+.2f')},{_num(r['ci_hi'], '+.2f')}]"
         best = f"{_num(r['exp_without_best'], '+.2f')} ({r['best_symbol'] or '-'})"
-        lines.append(f" {r['variant']:<33} {r['trades']:>6} {r['per_year']:>5.0f} {_num(r['expectancy_r'], '+.3f'):>7} "
+        unfunded = r.get("unfunded_capacity", 0) + r.get("unfunded_capital", 0)
+        lines.append(f" {r['variant']:<36} {r['trades']:>6} {r['per_year']:>4.0f} {_num(r['expectancy_r'], '+.3f'):>7} "
                      f"{ci:>15} {_num(r['gross_r'], '+.3f'):>7} {_num(r['breakeven_bps'], '.1f'):>6} "
-                     f"{_num(r['profit_factor']):>5} {_pct(r['max_drawdown']):>7} {best:>15} {_num(r['nights'], '.1f'):>6}")
+                     f"{_num(r['profit_factor']):>5} {_pct(r.get('cagr')):>7} {_num(r.get('sharpe')):>6} "
+                     f"{_pct(r['max_drawdown']):>7} {best:>15} {_num(r['nights'], '.1f'):>6} {unfunded:>8}")
+    bench = tables.get("benchmark") or {}
+    if bench.get("spy"):
+        spy = bench["spy"]
+        lines.append(f" {'benchmark: SPY buy & hold':<36} {'':>6} {'':>4} {'':>7} {'':>15} {'':>7} {'':>6} {'':>5} "
+                     f"{_pct(spy['cagr']):>7} {_num(spy['sharpe']):>6} {_pct(spy['max_drawdown']):>7}")
+    if setup and setup["cash_yield"]:
+        lines.append(f" {'benchmark: cash':<36} {'':>6} {'':>4} {'':>7} {'':>15} {'':>7} {'':>6} {'':>5} "
+                     f"{_pct(setup['cash_yield']):>7}")
+    if "heat" in tables and len(tables["heat"]):
+        lines += ["-" * width, " Heat / sizing study: same rules and calendar, max_position_notional x ranking "
+                               "('BP-bound' = share of trades cut by the capital left; 'unfunded' = valid signals not taken)",
+                  f" {'notional':>8} {'ranking':<12} {'trades':>6} {'exp R':>7} {'CAGR':>7} {'Sharpe':>6} {'maxDD':>7} "
+                  f"{'avg gross':>9} {'BP-bound':>8} {'unfunded: full':>14} {'no capital':>10}"]
+        for _, r in tables["heat"].iterrows():
+            lines.append(f" {r['notional']:>8.0%} {r['rank']:<12} {r['trades']:>6} {_num(r['expectancy_r'], '+.3f'):>7} "
+                         f"{_pct(r['cagr']):>7} {_num(r['sharpe']):>6} {_pct(r['max_drawdown']):>7} "
+                         f"{_pct(r['avg_gross'], False):>9} {_pct(r['bp_bound'], False):>8} "
+                         f"{r['unfunded_capacity']:>14} {r['unfunded_capital']:>10}")
     lines += ["-" * width, " Paired exit study: the same v1 entry signals, each exit simulated on its own (delta vs v1 exit)",
               f" {'exit':<29} {'signals':>7} {'exp R':>7} {'delta R':>8} {'95% CI of delta':>17} {'nights':>6}  exit mix"]
     for _, r in tables["exits"].iterrows():
         ci = f"[{_num(r['delta_lo'], '+.3f')},{_num(r['delta_hi'], '+.3f')}]" if r["delta_r"] == r["delta_r"] else "-"
         lines.append(f" {r['exit']:<29} {r['signals']:>7} {_num(r['expectancy_r'], '+.3f'):>7} "
                      f"{_num(r['delta_r'], '+.3f'):>8} {ci:>17} {_num(r['nights'], '.1f'):>6}  {r['mix']}")
-    lines += ["-" * width, " Entry rules vs the v1 signals (R under the v2 default exit; 'added' = signals v1 did not have)",
+    lines += ["-" * width, " Entry rules vs the v1 signals (R per signal under the default exit, no capital limits; "
+                           "'added' = signals v1 did not have)",
               f" {'rule':<20} {'kept':>5} {'kept R':>8} {'removed':>8} {'removed R':>10} {'added':>6} {'added R':>8} "
               f"{'rule R':>7} {'vs random drop':>16}"]
     for _, r in tables["filters"].iterrows():
@@ -706,11 +891,14 @@ def format_comparison(tables: dict[str, pd.DataFrame], prior_runs: int = 0) -> s
                      f"{_num(r['variant_r'], '+.3f'):>7} {pct:>16}")
     lines += ["-" * width,
               " How to read this:",
-              "  * Every v2 change was proposed after looking at this window, so gains here are in-sample. Confirm on",
-              "    a period nobody has looked at (e.g. --start 2019-01-01 --end 2023-12-31) before relying on one.",
+              "  * Gains on a window you have already looked at are in-sample: every change since v1 was chosen on",
+              "    2022-2026 data. Judge v3 changes on a window nobody has used (e.g. --start 2019-10-01 --end 2022-09-30).",
               "  * A filter is only evidence if 'vs random drop' is above ~95% (randomly dropping whole weeks of",
               "    signals rarely does as well) and 'w/o best' stays >= 0 (it is not one stock's rally). Rules that",
               "    also add signals (anchor) cannot be judged that way: compare 'rule R' with v1 and check folds.",
+              "  * Ranking only decides which signal gets the capital when several arrive together. It changes",
+              "    results only on bars with 'unfunded' signals; if that count is small, ranking cannot matter much.",
+              "  * The RS rows need the benchmark (SPY) in the bars; 'RS >= median' depends on which symbols are loaded.",
               "  * 'BE bp' is the per-side cost (first-order, about +/-10%) at which gross expectancy is used up.",
               "    Blank = no gross edge at all.",
               "  * v1 rows have no earnings blackout (each isolates one change); 'v1 + earnings blackout' isolates it.",
@@ -801,7 +989,10 @@ def _day(value: Optional[str], end_of_day: bool = False) -> Optional[pd.Timestam
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--symbols", nargs="+", default=config.SYMBOLS)
+    parser.add_argument("--universe", choices=sorted(config.UNIVERSES), default="core5",
+                        help="named symbol list from config.UNIVERSES (core5 = the live SYMBOLS); "
+                             "--compare on a larger universe adds a core-symbols-only row")
+    parser.add_argument("--symbols", nargs="+", default=None, help="explicit symbol list (overrides --universe)")
     parser.add_argument("--years", type=float, default=BacktestConfig.years,
                         help="evaluation length when --start is not given")
     parser.add_argument("--start", help="first evaluation day, YYYY-MM-DD (earlier bars only warm up indicators)")
@@ -809,8 +1000,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--feed", default=None, help="iex (default, matches live) or sip")
     parser.add_argument("--equity", type=float, default=BacktestConfig.initial_equity)
     parser.add_argument("--slippage-bps", type=float, default=None,
-                        help="per-side cost on market/stop fills (default 5 = config.SLIPPAGE_PER_SIDE); "
-                             "rerun with 2 and 5 to see what depends on the cost assumption")
+                        help=f"per-side cost on market/stop fills (default {config.SLIPPAGE_PER_SIDE * 1e4:g} = "
+                             "config.SLIPPAGE_PER_SIDE); rerun with 2 and 5 to see what depends on the cost assumption")
+    parser.add_argument("--cash-yield", type=float, default=BacktestConfig.cash_yield, metavar="RATE",
+                        help="annual yield on idle cash, e.g. 0.045; Sharpe becomes excess of it (default 0)")
     parser.add_argument("--trades-out", help="write the trade list to this CSV")
     parser.add_argument("--save-bars", metavar="PATH",
                         help="save the hourly bars: bars.csv.gz (one file) or a directory of <SYMBOL>.csv")
@@ -819,12 +1012,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--earnings", default=config.EARNINGS_CALENDAR_PATH, metavar="CSV",
                         help="earnings calendar (symbol,date,timing) for the blackout; see src/events.py")
     parser.add_argument("--compare", action="store_true",
-                        help="v1 vs each v2 change vs v2 defaults, a paired exit study and a filter audit")
+                        help="v1 vs each change vs v3 defaults, a heat study, a paired exit study and a filter audit")
     parser.add_argument("--ledger", default=config.BACKTEST_LEDGER_PATH,
                         help="CSV log of every run, used to warn when a window has been looked at before")
     args = parser.parse_args(argv)
+    args.symbols = list(args.symbols or config.UNIVERSES[args.universe])
 
-    bt_cfg = BacktestConfig(years=args.years, initial_equity=args.equity)
+    bt_cfg = BacktestConfig(years=args.years, initial_equity=args.equity, cash_yield=args.cash_yield)
     strategy_cfg = StrategyConfig()
     if args.slippage_bps is not None:  # one cost assumption: fills, cost floor and breakeven move together
         bt_cfg = replace(bt_cfg, slippage_pct=args.slippage_bps / 1e4)
@@ -881,14 +1075,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("!" * 78)
     window = (start, max(df.index.max() for df in data.values()))
     if args.compare:
-        tables = compare_variants(data, start, bt_cfg, exec_cfg, calendar, strategy_cfg)
-        prior = append_ledger(args.ledger, window, list(data), [
-            {"variant": r["variant"], "trades": r["trades"], "expectancy_r": r["expectancy_r"]}
-            for _, r in tables["portfolio"].iterrows()])
+        tables = compare_variants(data, start, bt_cfg, exec_cfg, calendar, strategy_cfg, RiskConfig())
+        rows = [{"variant": r["variant"], "trades": r["trades"], "expectancy_r": r["expectancy_r"]}
+                for _, r in tables["portfolio"].iterrows()]
+        rows += [{"variant": f"heat {r['notional']:.0%} {r['rank']}", "trades": r["trades"],
+                  "expectancy_r": r["expectancy_r"]} for _, r in tables["heat"].iterrows()]
+        prior = append_ledger(args.ledger, window, list(data), rows)
         print(format_comparison(tables, prior))
         return 0
     result = Backtester(strategy_cfg, RiskConfig(), bt_cfg, exec_cfg, calendar).run(data, start=start)
-    append_ledger(args.ledger, window, list(data), [{"variant": "v2 (defaults)", "trades": result.metrics["n_trades"],
+    append_ledger(args.ledger, window, list(data), [{"variant": DEFAULTS_ROW, "trades": result.metrics["n_trades"],
                                                     "expectancy_r": result.metrics["expectancy_r"]}])
     print(format_tear_sheet(result))
     if args.trades_out:

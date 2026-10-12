@@ -33,6 +33,8 @@ R_ENTRY = "ENTRY_PULLBACK_RECLAIM"
 R_EXIT = "EXIT_CLOSE_BELOW_EMA_FAST"
 R_TRAIL = "EXIT_RATCHET_STOP_AT_PRICE"
 R_TIME = "EXIT_MAX_HOLD"
+R_RS = "RS_LAGGARD"
+R_RS_NO_BENCHMARK = "RS_NO_BENCHMARK"
 R_CALENDAR = "EARNINGS_CALENDAR_STALE"
 R_EARNINGS = "EARNINGS_BLACKOUT"
 R_HOLD = "IN_POSITION_HOLD"
@@ -172,6 +174,69 @@ def ratchet_stop(current_stop: float, entry_fill: float, entry_ref: float, initi
 def stop_too_close(stop: float, last_close: float, cfg: StrategyConfig) -> bool:
     """A sell stop at or just under the market is rejected or fires at once: exit at market instead."""
     return stop >= last_close * (1.0 - cfg.stop_buffer_pct)
+
+
+# ----------------------------------------------------------------------------- cross-sectional
+# Both engines call these with the same per-symbol values from bar t-1, so the live bot and the
+# backtester fund the same candidates in the same order.
+
+def trend_spread(close: float, ema_slow: float) -> float:
+    """Close / EMA_slow - 1 on the signal bar: a parameter-free measure of trend strength."""
+    if not (np.isfinite(close) and np.isfinite(ema_slow)) or ema_slow <= 0:
+        return float("nan")
+    return close / ema_slow - 1.0
+
+
+def rank_metric(sig_values: dict, cfg: StrategyConfig) -> float:
+    """Value used to order simultaneous entry candidates (higher first). `sig_values` holds the
+    t-1 snapshot: natr, adx, close, ema_slow."""
+    if cfg.signal_rank_by is None:
+        return 0.0
+    if cfg.signal_rank_by == "natr":
+        value = sig_values.get("natr")
+    elif cfg.signal_rank_by == "adx":
+        value = sig_values.get("adx")
+    elif cfg.signal_rank_by == "rs_ema":
+        value = trend_spread(sig_values.get("close", np.nan), sig_values.get("ema_slow", np.nan))
+    else:
+        raise ValueError(f"signal_rank_by must be None, 'natr', 'adx' or 'rs_ema', got {cfg.signal_rank_by!r}")
+    value = float(value) if value is not None else float("nan")
+    return value if np.isfinite(value) else float("-inf")
+
+
+def rank_candidates(candidates: list[str], metrics: dict[str, float], order: list[str],
+                    cfg: StrategyConfig) -> list[str]:
+    """Candidates sorted by metric descending, ties broken by symbol name. With signal_rank_by
+    None the v2 behaviour is kept: the order of `order` (the SYMBOLS list)."""
+    if cfg.signal_rank_by is None:
+        position = {s: i for i, s in enumerate(order)}
+        return sorted(candidates, key=lambda s: position.get(s, len(position)))
+    return sorted(candidates, key=lambda s: (-metrics.get(s, float("-inf")), s))
+
+
+def relative_strength_ok(symbol: str, spreads: dict[str, float], cfg: StrategyConfig,
+                         universe: list[str]) -> tuple[bool, str, str]:
+    """(passes, reason_code, detail) for the RS filter. `spreads` are t-1 trend spreads of every
+    symbol available on this bar (the benchmark included even if it is not traded)."""
+    if cfg.rs_filter is None:
+        return True, "", ""
+    own = spreads.get(symbol, float("nan"))
+    if not np.isfinite(own):
+        return False, R_RS, f"{R_RS}: no trend spread for {symbol}"
+    if cfg.rs_filter == "vs_benchmark":
+        bench = spreads.get(cfg.rs_benchmark, float("nan"))
+        if not np.isfinite(bench):
+            return False, R_RS_NO_BENCHMARK, f"{R_RS_NO_BENCHMARK}: no {cfg.rs_benchmark} bar to compare with"
+        ok = own >= bench
+        return ok, ("" if ok else R_RS), (f"{R_RS}: Close/EMA{cfg.ema_slow}-1 {own:+.2%} < "
+                                          f"{cfg.rs_benchmark} {bench:+.2%}" if not ok else "")
+    if cfg.rs_filter == "vs_median":
+        values = [spreads[s] for s in universe if s in spreads and np.isfinite(spreads[s])]
+        median = float(np.median(values))
+        ok = own >= median
+        return ok, ("" if ok else R_RS), (f"{R_RS}: Close/EMA{cfg.ema_slow}-1 {own:+.2%} < universe median "
+                                          f"{median:+.2%} ({len(values)} symbols)" if not ok else "")
+    raise ValueError(f"rs_filter must be None, 'vs_benchmark' or 'vs_median', got {cfg.rs_filter!r}")
 
 
 def resolve_state(sig: pd.Series, in_position: bool, ema_exit_allowed: bool = True,
