@@ -168,6 +168,20 @@ def check_execution(df: pd.DataFrame, assumed_bps: float) -> list[Check]:
     return out
 
 
+def max_entry_gross(df: pd.DataFrame) -> float:
+    """Largest sum of open positions' notional_pct right after an entry fill (each position at
+    its own entry price and equity; good enough to catch the bot using margin)."""
+    rows = df[df["event"].isin([J.ENTRY_FILL, J.EXIT_FILL])].sort_values("ts_utc")
+    open_pct, worst = {}, 0.0
+    for row in rows.itertuples(index=False):
+        if row.event == J.ENTRY_FILL:
+            open_pct[row.symbol] = float(row.notional_pct) if pd.notna(row.notional_pct) else 0.0
+            worst = max(worst, sum(open_pct.values()))
+        else:
+            open_pct.pop(row.symbol, None)
+    return worst
+
+
 def check_risk(df: pd.DataFrame, risk_cfg: RiskConfig) -> list[Check]:
     out = []
     fills = _rows(df, J.ENTRY_FILL)
@@ -180,6 +194,11 @@ def check_risk(df: pd.DataFrame, risk_cfg: RiskConfig) -> list[Check]:
         out.append(Check("Risk", "Position notional <= cap",
                          PASS if max_notional <= risk_cfg.max_position_notional * 1.05 else FAIL,
                          f"max {max_notional:.2%} (cap {risk_cfg.max_position_notional:.0%})"))
+        gross = max_entry_gross(df)
+        out.append(Check("Risk", "Gross exposure at entry <= cap",
+                         PASS if gross <= risk_cfg.max_gross_exposure * 1.05 else FAIL,
+                         f"max {gross:.0%} of equity right after an entry, at entry prices "
+                         f"(cap {risk_cfg.max_gross_exposure:.0%}; margin buying power must not be used)"))
     pnl = df["daily_pnl_pct"].dropna()
     if len(pnl):
         worst = pnl.min()
@@ -199,8 +218,10 @@ def check_replay(df: pd.DataFrame, symbols: list[str], strategy_cfg: StrategyCon
 
     checks = _rows(df, J.BAR_CHECK).dropna(subset=["decision_bar_et"])
     checks = checks[checks["in_position"].astype(str) != "True"]
-    # Calendar-driven decisions do not come from bars, so a bar replay cannot reproduce them.
-    checks = checks[~checks["reason_code"].isin(["EARNINGS_BLACKOUT", "EARNINGS_CALENDAR_STALE"])]
+    # Calendar-driven and cross-sectional (RS filter) decisions do not come from one symbol's
+    # bars, so a per-symbol bar replay cannot reproduce them.
+    checks = checks[~checks["reason_code"].isin(["EARNINGS_BLACKOUT", "EARNINGS_CALENDAR_STALE",
+                                                 "RS_LAGGARD", "RS_NO_BENCHMARK"])]
     if checks.empty:
         return [Check("Parity", "Live vs replay signals", INCONCLUSIVE, "no flat bar checks to compare")]
     try:

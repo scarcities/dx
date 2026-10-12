@@ -1809,6 +1809,22 @@ def test_evaluate_trust_needs_twenty_weeks_before_judging_edge():
     assert edge.status == "INCONCLUSIVE" and "distinct weeks" in edge.detail
 
 
+def test_evaluate_trust_checks_gross_exposure():
+    t = pd.Timestamp("2026-06-01 15:00", tz="UTC")
+    rows = [{"event": J.ENTRY_FILL, "symbol": "AAA", "notional_pct": 0.33, "risk_pct": 0.005, "ts_utc": t},
+            {"event": J.ENTRY_FILL, "symbol": "BBB", "notional_pct": 0.33, "risk_pct": 0.005,
+             "ts_utc": t + pd.Timedelta(hours=1)},
+            {"event": J.EXIT_FILL, "symbol": "AAA", "ts_utc": t + pd.Timedelta(hours=2)},
+            {"event": J.ENTRY_FILL, "symbol": "CCC", "notional_pct": 0.33, "risk_pct": 0.005,
+             "ts_utc": t + pd.Timedelta(hours=3)}]
+    df = pd.DataFrame(rows).reindex(columns=COLUMNS)
+    assert evaluate_trust.max_entry_gross(df) == pytest.approx(0.66)          # AAA left before CCC came
+    status = {c.name: c.status for c in evaluate_trust.check_risk(df, replace(RISK, max_gross_exposure=0.60))}
+    assert status["Gross exposure at entry <= cap"] == "FAIL"
+    status = {c.name: c.status for c in evaluate_trust.check_risk(df, replace(RISK, max_position_notional=0.33))}
+    assert status["Gross exposure at entry <= cap"] == "PASS"
+
+
 def test_evaluate_trust_flags_duplicate_orders():
     rows = [{"event": J.ORDER_SUBMITTED, "symbol": "SPY", "client_order_id": "x"},
             {"event": J.ORDER_SUBMITTED, "symbol": "SPY", "client_order_id": "x"}]
@@ -2071,3 +2087,32 @@ def test_live_rs_filter_fetches_the_benchmark_and_blocks_laggards(portfolio, tmp
     bot = _make_bot(broker, TradeJournal(str(tmp_path / "rs2.csv")), symbols=["AAA", "DDD"], cfg=cfg)
     _step(bot, broker, signal_bar + pd.Timedelta(seconds=25))
     assert [o["symbol"] for o in broker.submitted] == ["DDD"]
+
+
+# ============================================================================ SEC EDGAR calendar tool
+def test_edgar_item_202_filings_and_calendar_check(monkeypatch, capsys):
+    from tools.build_earnings_calendar import compare, earnings_filings, main, merged_rows
+
+    d = dt.date
+    recent = {"filings": {"recent": {
+        "form": ["8-K", "8-K", "10-Q", "8-K", "8-K"],
+        "items": ["2.02,9.01", "5.07", "", "2.02,9.01", "2.02"],
+        "acceptanceDateTime": ["2024-02-01T16:30:52.000Z", "2024-02-20T08:00:00.000Z", "2024-02-02T16:00:00.000Z",
+                               "2024-05-02T16:31:00.000Z", "2024-04-12T06:58:00.000Z"],
+        "accessionNumber": ["a", "b", "c", "d", "e"]}}}
+    older = {"form": ["8-K", "8-K"], "items": ["2.02,9.01", "2.02"], "accessionNumber": ["f", "g"],
+             "acceptanceDateTime": ["2023-11-02T16:30:00.000Z", "2018-11-01T16:30:00.000Z"]}
+    filings = earnings_filings([recent, older], d(2019, 7, 1))
+    assert list(filings["date"]) == [d(2023, 11, 2), d(2024, 2, 1), d(2024, 4, 12), d(2024, 5, 2)]
+    assert list(filings["timing"]) == ["AMC", "AMC", "BMO", "AMC"]
+    calendar = [(d(2023, 11, 2), "AMC"), (d(2024, 2, 2), "AMC"), (d(2024, 4, 12), "AMC"), (d(2024, 8, 1), "AMC")]
+    report = compare(calendar, filings, d(2019, 7, 1), d(2024, 6, 30))
+    status = {(r.calendar, r.edgar): r.status for r in report.itertuples()}
+    assert status == {(d(2023, 11, 2), d(2023, 11, 2)): "ok", (d(2024, 2, 2), d(2024, 2, 1)): "DATE DIFFERS",
+                      (d(2024, 4, 12), d(2024, 4, 12)): "TIMING DIFFERS", (None, d(2024, 5, 2)): "EDGAR ONLY"}
+    merged = merged_rows(pd.DataFrame(columns=["symbol", "date", "timing", "source"]), "AAPL", report)
+    assert merged.to_dict("records") == [{"symbol": "AAPL", "date": "2024-05-02", "timing": "AMC",
+                                          "source": "SEC 8-K Item 2.02 accepted 2024-05-02 16:31 ET"}]
+    monkeypatch.delenv("SEC_USER_AGENT", raising=False)
+    assert main(["--symbols", "AAPL"]) == 2                     # no contact address: nothing is sent
+    assert "User-Agent" in capsys.readouterr().out
